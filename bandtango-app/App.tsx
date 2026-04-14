@@ -16,6 +16,7 @@ import { Pressable, Text, View } from 'react-native';
 import './global.css';
 import { NowPlayingMiniBar } from './src/components/NowPlayingMiniBar';
 import { seedPlaylists } from './src/data/seed';
+import { AddPlaylistScreen } from './src/screens/AddPlaylistScreen';
 import { CreatePlaylistScreen } from './src/screens/CreatePlaylistScreen';
 import { AudioAgentScreen } from './src/screens/AudioAgentScreen';
 import { DiscoveryLevelScreen } from './src/screens/DiscoveryLevelScreen';
@@ -25,6 +26,7 @@ import { LoginScreen } from './src/screens/LoginScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { PlaylistsScreen } from './src/screens/PlaylistsScreen';
 import { PlaylistDetailScreen } from './src/screens/PlaylistDetailScreen';
+import { HLSListeningScreen } from './src/screens/HLSListeningScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { NowPlayingProvider } from './src/state/NowPlayingContext';
 import { Playlist, RootStackParamList, Song } from './src/types';
@@ -147,6 +149,29 @@ function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
               paddingVertical: 12,
             }}
             onPress={() => {
+              navigation.navigate('MainStack', { screen: 'HLSListening' });
+              navigation.closeDrawer();
+            }}
+          >
+            <View style={{ alignItems: 'center', flexDirection: 'row' }}>
+              <Ionicons color="#00CAF5" name="radio-outline" size={18} />
+              <View style={{ width: 8 }} />
+              <Text style={{ color: '#F8FAFC', fontSize: 15, fontWeight: '600' }}>
+                HLS Listening
+              </Text>
+            </View>
+          </Pressable>
+
+          <Pressable
+            style={{
+              marginBottom: 10,
+              borderColor: '#334155',
+              borderRadius: 12,
+              borderWidth: 1,
+              paddingHorizontal: 12,
+              paddingVertical: 12,
+            }}
+            onPress={() => {
               navigation.navigate('MainStack', { screen: 'Explore' });
               navigation.closeDrawer();
             }}
@@ -193,12 +218,13 @@ function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
 export default function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>(seedPlaylists);
 
-  const addPlaylist = (payload: { name: string; description: string }) => {
+  const addPlaylist = (payload: { name: string; description: string; url?: string }) => {
     setPlaylists((current) => [
       {
         id: Date.now().toString(),
         name: payload.name,
         description: payload.description,
+        url: payload.url,
         songs: [],
       },
       ...current,
@@ -207,7 +233,7 @@ export default function App() {
 
   const addSong = (
     playlistId: string,
-    payload: { title: string; artist: string; duration: string }
+    payload: { title: string; artist: string; duration: string; audioUrl?: string }
   ) => {
     setPlaylists((current) =>
       current.map((playlist) => {
@@ -220,6 +246,7 @@ export default function App() {
           title: payload.title,
           artist: payload.artist,
           duration: payload.duration,
+          audioUrl: payload.audioUrl,
         };
 
         return {
@@ -310,6 +337,12 @@ export default function App() {
       />
 
       <Stack.Screen
+        name="HLSListening"
+        component={HLSListeningScreen}
+        options={{ title: 'HLS Listening' }}
+      />
+
+      <Stack.Screen
         name="Settings"
         component={SettingsScreen}
         options={{ title: 'Settings' }}
@@ -326,6 +359,12 @@ export default function App() {
         component={LoginScreen}
         options={{ title: 'Login', headerShown: false }}
       />
+
+      <Stack.Screen name="AddPlaylist" options={{ title: 'New Playlist' }}>
+        {(props) => (
+          <AddPlaylistScreen {...props} onCreatePlaylist={addPlaylist} />
+        )}
+      </Stack.Screen>
 
       <Stack.Screen name="CreatePlaylist" options={{ title: 'New Playlist' }}>
         {(props) => (

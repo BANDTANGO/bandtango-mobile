@@ -1,6 +1,6 @@
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useState } from 'react';
-import { Text, View, Pressable, TextInput, Alert } from 'react-native';
+import { Text, View, Pressable, TextInput, Alert, ImageBackground } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { RootStackParamList } from '../types';
 
@@ -26,7 +26,14 @@ export function LoginScreen({ navigation }: LoginScreenProps) {
   };
 
   return (
-    <View className="flex-1 bg-[#0B1220] pt-12">
+    <View className="flex-1 pt-12">
+      <ImageBackground
+        source={require('../../assets/background.jpg')}
+        resizeMode="cover"
+        style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, width: '100%', height: '100%' }}
+      >
+        <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11, 18, 32, 0.72)' }} />
+      </ImageBackground>
       <View className="px-6">
         {/* Header */}
         <View className="mb-8">

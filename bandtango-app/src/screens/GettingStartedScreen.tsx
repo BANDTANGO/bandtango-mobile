@@ -1,5 +1,5 @@
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { Text, View, Pressable, Image } from 'react-native';
+import { Text, View, Pressable, Image, ImageBackground } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { RootStackParamList } from '../types';
 
@@ -7,7 +7,14 @@ type GettingStartedScreenProps = NativeStackScreenProps<RootStackParamList, 'Get
 
 export function GettingStartedScreen({ navigation }: GettingStartedScreenProps) {
   return (
-    <View className="flex-1 bg-[#0B1220] pt-1">
+    <View className="flex-1 pt-1">
+      <ImageBackground
+        source={require('../../assets/background.jpg')}
+        resizeMode="cover"
+        style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, width: '100%', height: '100%' }}
+      >
+        <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11, 18, 32, 0.72)' }} />
+      </ImageBackground>
       <View className="flex-1 items-center justify-center">
         <View className="justify-start items-center pt-4">
             <View style={{ width: '100%', height: 256, alignItems: 'center' }}>

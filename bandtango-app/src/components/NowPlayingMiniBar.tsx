@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Modal, Pressable, Text, View } from 'react-native';
 import { useNowPlaying } from '../state/NowPlayingContext';
 
@@ -8,6 +8,14 @@ export function NowPlayingMiniBar() {
   const {
     currentTrack,
     state,
+    activeHlsUrl,
+    hlsAudioRef,
+    activeHlsTitle,
+    activeHlsArtist,
+    activeHlsPlaying,
+    toggleHlsPlay,
+    positionMs: ctxPositionMs,
+    durationMs: ctxDurationMs,
     nextTrack,
     previousTrack,
     togglePlay,
@@ -20,12 +28,63 @@ export function NowPlayingMiniBar() {
   const [expanded, setExpanded] = useState(false);
   const [barWidth, setBarWidth] = useState(0);
 
+  // ── Elapsed ticker — reads directly from the persisted audio element so it
+  //    keeps ticking even when LivePlayerCard is unmounted (navigated away).
+  const [elapsedSec, setElapsedSec] = useState(0);
+  useEffect(() => {
+    if (!activeHlsUrl) { setElapsedSec(0); return; }
+    const tick = setInterval(() => {
+      const a = hlsAudioRef.current;
+      if (a) setElapsedSec(Math.floor(a.currentTime));
+    }, 1000);
+    return () => clearInterval(tick);
+  }, [activeHlsUrl, hlsAudioRef]);
+
+  // ── HLS live stream mini bar ───────────────────────────────────────────────
+  if (activeHlsUrl) {
+    return (
+      <View className="border-t border-[#334155] bg-[#0B1220] px-4 py-3">
+        <View className="flex-row items-center justify-between">
+          {/* LIVE badge + metadata */}
+          <View className="mr-3 flex-1 flex-row items-center gap-2">
+            <View style={{ width: 1, height: 28, backgroundColor: '#1E293B' }} />
+            <View style={{ flex: 1 }}>
+              <Text className="text-sm font-semibold text-[#F8FAFC]" numberOfLines={1}>
+                {activeHlsTitle || 'Live Stream'}
+              </Text>
+              {activeHlsArtist ? (
+                <Text className="mt-0.5 text-xs text-[#94A3B8]" numberOfLines={1}>
+                  {activeHlsArtist}
+                </Text>
+              ) : null}
+            </View>
+          </View>
+
+          {/* Elapsed + play/pause */}
+          <View className="flex-row items-center gap-2">
+            <Text style={{ color: '#00CAF5', fontSize: 13, fontWeight: '700', fontVariant: ['tabular-nums'] }}>
+              {String(Math.floor(elapsedSec / 60)).padStart(2, '0')}:{String(elapsedSec % 60).padStart(2, '0')}
+            </Text>
+            <Pressable
+              className="h-10 w-10 items-center justify-center rounded-full bg-[#00CAF5]"
+              onPress={toggleHlsPlay}
+            >
+              <Ionicons name={activeHlsPlaying ? 'pause' : 'play'} size={18} color="#0F172A" />
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    );
+  }
+
+  // ── Regular track mini bar ─────────────────────────────────────────────────
   if (!currentTrack || !state.isVisible) {
     return null;
   }
 
-  const durationMs = state.durationMs || 236000;
-  const positionMs = Math.max(0, Math.min(state.positionMs, durationMs));
+  const isLive = ctxDurationMs === 0 && !!currentTrack.audioUrl;
+  const durationMs = isLive ? 0 : (ctxDurationMs || 236000);
+  const positionMs = Math.max(0, Math.min(ctxPositionMs, durationMs || ctxPositionMs));
   const progressRatio = durationMs > 0 ? positionMs / durationMs : 0;
   const clampedRatio = Math.max(0, Math.min(progressRatio, 1));
   const progressPercent = Math.round(clampedRatio * 100);

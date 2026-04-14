@@ -1,6 +1,6 @@
 import Slider from '@react-native-community/slider';
 import { useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { ImageBackground, Pressable, Text, View } from 'react-native';
 
 const moods = ['Smooth', 'Thoughtful', 'Energetic', 'Chill'] as const;
 
@@ -9,7 +9,14 @@ export function DiscoveryLevelScreen() {
   const [selectedMood, setSelectedMood] = useState<(typeof moods)[number]>('Smooth');
 
   return (
-    <View className="flex-1 bg-[#0B1220] px-5 pt-6">
+    <View className="flex-1 px-5 pt-6">
+      <ImageBackground
+        source={require('../../assets/background.jpg')}
+        resizeMode="cover"
+        style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, width: '100%', height: '100%' }}
+      >
+        <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11, 18, 32, 0.72)' }} />
+      </ImageBackground>
       <Text className="text-sm text-[#94A3B8]">
         How adventurous should your music discovery be?
       </Text>

@@ -1,5 +1,5 @@
 import { Ionicons, MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 import { PlayerTrack, useNowPlaying } from '../state/NowPlayingContext';
 
@@ -24,6 +24,8 @@ export function MusicPlayerControls({
 }: MusicPlayerControlsProps) {
   const {
     state,
+    positionMs: ctxPositionMs,
+    durationMs: ctxDurationMs,
     currentTrack: nowPlayingTrack,
     setSession,
     togglePlay,
@@ -39,21 +41,37 @@ export function MusicPlayerControls({
   const safeTracks = tracks && tracks.length > 0 ? tracks : [{ title, artist, duration: '3:56' }];
   const safeInitialIndex = Math.max(0, Math.min(initialTrackIndex, safeTracks.length - 1));
 
+  // Keep a ref to setSession so we can call the latest version without it
+  // being a useEffect dependency (avoids re-running on every positionMs update)
+  const setSessionRef = useRef(setSession);
+  setSessionRef.current = setSession;
+
+  // Stable refs for the values we need inside the effect
+  const safeTracksRef = useRef(safeTracks);
+  safeTracksRef.current = safeTracks;
+  const safeInitialIndexRef = useRef(safeInitialIndex);
+  safeInitialIndexRef.current = safeInitialIndex;
+  const progressPercentRef = useRef(progressPercent);
+  progressPercentRef.current = progressPercent;
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+
   const [barWidth, setBarWidth] = useState(0);
 
   useEffect(() => {
-    if (state.sessionId) {
+    // Only fire when the sessionId itself changes — not on every positionMs update
+    if (state.sessionId === sessionId) {
       return;
     }
 
-    setSession({
+    setSessionRef.current({
       sessionId,
-      tracks: safeTracks,
-      initialTrackIndex: safeInitialIndex,
-      initialProgressPercent: progressPercent,
-      autoplay: isPlaying,
+      tracks: safeTracksRef.current,
+      initialTrackIndex: safeInitialIndexRef.current,
+      initialProgressPercent: progressPercentRef.current,
+      autoplay: isPlayingRef.current,
     });
-  }, [isPlaying, progressPercent, safeInitialIndex, safeTracks, sessionId, setSession, state.sessionId]);
+  }, [sessionId, state.sessionId]);
 
   const isActiveSession = state.sessionId === sessionId;
 
@@ -61,6 +79,9 @@ export function MusicPlayerControls({
     isActiveSession && nowPlayingTrack
       ? nowPlayingTrack
       : safeTracks[safeInitialIndex] ?? safeTracks[0];
+
+  // A live/HLS stream reports durationMs = 0 (unknown duration)
+  const isLive = isActiveSession && ctxDurationMs === 0 && !!displayedTrack.audioUrl;
 
   const parseDurationMs = (raw?: string) => {
     if (!raw) {
@@ -78,10 +99,10 @@ export function MusicPlayerControls({
   const inactiveDurationMs = parseDurationMs(displayedTrack.duration);
 
   const activeDurationMs = isActiveSession
-    ? state.durationMs || 236000
+    ? (ctxDurationMs > 0 ? ctxDurationMs : (isLive ? 0 : 236000))
     : inactiveDurationMs;
   const activePositionMs = isActiveSession
-    ? state.positionMs
+    ? ctxPositionMs
     : Math.round((Math.max(0, Math.min(progressPercent, 100)) / 100) * inactiveDurationMs);
 
   const progressRatio = activeDurationMs > 0 ? activePositionMs / activeDurationMs : 0;
@@ -168,6 +189,12 @@ export function MusicPlayerControls({
         </View>
       </View>
 
+      {isLive ? (
+        <View className="mb-1.5 flex-row items-center justify-center h-[7px]">
+          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#EF4444', marginRight: 6 }} />
+          <Text style={{ color: '#EF4444', fontSize: 11, fontWeight: '700', letterSpacing: 1 }}>LIVE</Text>
+        </View>
+      ) : (
       <Pressable
         className="mb-1.5 h-[7px] w-full rounded-full bg-[#334155]"
         onLayout={(event) => setBarWidth(event.nativeEvent.layout.width)}
@@ -182,13 +209,14 @@ export function MusicPlayerControls({
           style={{ left: knobX }}
         />
       </Pressable>
+      )}
 
       <View className="mb-3 flex-row items-center justify-between">
         <Text className="text-[11px] text-[#94A3B8]">
-          {formatTime(Math.floor(activePositionMs / 1000))}
+          {isLive ? formatTime(Math.floor(activePositionMs / 1000)) : formatTime(Math.floor(activePositionMs / 1000))}
         </Text>
         <Text className="text-[11px] text-[#94A3B8]">
-          {formatTime(Math.floor(activeDurationMs / 1000))}
+          {isLive ? '∞' : formatTime(Math.floor(activeDurationMs / 1000))}
         </Text>
       </View>
 

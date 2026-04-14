@@ -11,6 +11,7 @@ export type Playlist = {
   id: string;
   name: string;
   description: string;
+  url?: string;
   songs: Song[];
 };
 
@@ -20,8 +21,10 @@ export type MainStackParamList = {
   DiscoveryLevel: undefined;
   AudioAgent: undefined;
   Explore: undefined;
+  HLSListening: undefined;
   PlaylistDetail: { playlistId: string };
   CreatePlaylist: undefined;
+  AddPlaylist: undefined;
   Settings: undefined;
 };
 

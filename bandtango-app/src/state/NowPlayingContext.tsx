@@ -1,7 +1,9 @@
-import { Audio, AVPlaybackStatus } from 'expo-av';
+import { Platform } from 'react-native';
+import { createPlayer, PlayerInstance } from '../utils/audioPlayer';
 import {
   createContext,
   ReactNode,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -14,6 +16,10 @@ export type PlayerTrack = {
   artist: string;
   duration?: string;
   audioUrl?: string;
+};
+
+export type HlsStreamInfo = {
+  elapsedSec: number;
 };
 
 type SetSessionPayload = {
@@ -33,14 +39,37 @@ type NowPlayingState = {
   repeatEnabled: boolean;
   favoriteEnabled: boolean;
   queueEnabled: boolean;
+  isVisible: boolean;
+};
+
+// Separate type for frequently-changing playback position so it doesn't
+// invalidate the main context value on every audio tick.
+type PlaybackPosition = {
   positionMs: number;
   durationMs: number;
-  isVisible: boolean;
 };
 
 type NowPlayingContextValue = {
   state: NowPlayingState;
+  positionMs: number;
+  durationMs: number;
   currentTrack?: PlayerTrack;
+  hlsStream: HlsStreamInfo | null;
+  setHlsStream: (info: HlsStreamInfo | null) => void;
+  registerHlsToggle: (fn: (() => void) | null) => void;
+  toggleHlsPlay: () => void;
+  /** Stable ref to the persisted HLS audio element — survives navigation. */
+  hlsAudioRef: { current: HTMLAudioElement | null };
+  /** Single source of truth for what HLS URL is currently active. */
+  activeHlsUrl: string;
+  setActiveHlsUrl: (url: string) => void;
+  /** Stable title/artist — only updates when metadata genuinely changes, not every ticker tick. */
+  activeHlsTitle: string;
+  activeHlsArtist: string;
+  setActiveHlsMeta: (title: string, artist: string) => void;
+  /** Stable playing flag — written by LivePlayerCard DOM event listeners, read by MiniBar. */
+  activeHlsPlaying: boolean;
+  setActiveHlsPlaying: (playing: boolean) => void;
   setSession: (payload: SetSessionPayload) => void;
   togglePlay: () => void;
   nextTrack: () => void;
@@ -58,6 +87,11 @@ const NowPlayingContext = createContext<NowPlayingContextValue | null>(null);
 const parseDurationToSec = (raw?: string) => {
   if (!raw) {
     return 236;
+  }
+
+  // Live / unknown duration marker — return 0 so durationMs stays 0 (LIVE mode)
+  if (raw === '--:--' || raw === 'LIVE' || raw === '∞') {
+    return 0;
   }
 
   const [min, sec] = raw.split(':').map((value) => Number.parseInt(value, 10));
@@ -78,12 +112,62 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
     repeatEnabled: false,
     favoriteEnabled: true,
     queueEnabled: false,
-    positionMs: 0,
-    durationMs: 0,
     isVisible: true,
   });
 
-  const soundRef = useRef<Audio.Sound | null>(null);
+  // Keep position in a separate state so audio ticks don't invalidate the
+  // main context value (which would re-render all consumers every 250ms).
+  const [position, setPosition] = useState<PlaybackPosition>({ positionMs: 0, durationMs: 0 });
+
+  const soundRef = useRef<PlayerInstance | null>(null);
+  // Keep a ref to position so callbacks (seekToRatio, fake tick) can read the
+  // latest value without needing it as a useEffect dep.
+  const positionRef = useRef<PlaybackPosition>({ positionMs: 0, durationMs: 0 });
+  positionRef.current = position;
+
+  // HLS stream display state (written by HLSListeningScreen, read by MiniBar)
+  const [hlsStream, setHlsStream] = useState<HlsStreamInfo | null>(null);
+  // Single source of truth for the active HLS URL — stable across re-renders.
+  const [activeHlsUrl, setActiveHlsUrlState] = useState<string>('');
+  // Stable title/artist: set by LivePlayerCard from metadata fetch, not updated every tick.
+  const [activeHlsTitle,  setActiveHlsTitleState]  = useState('');
+  const [activeHlsArtist, setActiveHlsArtistState] = useState('');
+  const [activeHlsPlaying, setActiveHlsPlayingState] = useState(false);
+  const setActiveHlsPlaying = useCallback((playing: boolean) => {
+    setActiveHlsPlayingState(playing);
+  }, []);
+  const setActiveHlsMeta = useCallback((title: string, artist: string) => {
+    setActiveHlsTitleState(title);
+    setActiveHlsArtistState(artist);
+  }, []);
+  const setActiveHlsUrl = useCallback((url: string) => {
+    setActiveHlsUrlState(url);
+    // When explicitly cleared, also tear down the persisted audio element and hide MiniBar.
+    if (!url) {
+      const a = hlsAudioRef.current;
+      if (a) { a.pause(); a.src = ''; }
+      hlsAudioRef.current = null;
+      setHlsStream(null);
+      setActiveHlsTitleState('');
+      setActiveHlsArtistState('');
+      setActiveHlsPlayingState(false);
+    }
+  }, []);  // setState setters are stable — no deps needed
+  // Persisted audio element — lives for the lifetime of the provider, not the card.
+  const hlsAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Ref to the play/pause toggle function registered by HLSListeningScreen
+  const hlsToggleRef = useRef<(() => void) | null>(null);
+  const setHlsStreamCallback = useCallback((info: HlsStreamInfo | null) => {
+    setHlsStream(info);
+    if (info === null) hlsToggleRef.current = null;
+  }, []);
+  const registerHlsToggle = useCallback((fn: (() => void) | null) => {
+    hlsToggleRef.current = fn;
+  }, []);
+  const toggleHlsPlay = useCallback(() => {
+    hlsToggleRef.current?.();
+  }, []);
+
   const repeatRef = useRef(state.repeatEnabled);
   const shuffleRef = useRef(state.shuffleEnabled);
   const playingRef = useRef(state.playing);
@@ -97,22 +181,20 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
   }, [state.repeatEnabled, state.shuffleEnabled, state.playing, state.tracks]);
 
   useEffect(() => {
-    Audio.setAudioModeAsync({
-      playsInSilentModeIOS: true,
-      shouldDuckAndroid: true,
-    }).catch(() => undefined);
+    if (Platform.OS !== 'web') {
+      // Keep audio playing while the screen is locked on native
+      const { setAudioModeAsync } = require('expo-audio');
+      setAudioModeAsync({ playsInSilentModeIOS: true, shouldDuckAndroid: true }).catch(() => undefined);
+    }
   }, []);
 
   const currentTrack = state.tracks[state.currentIndex];
   const durationFallbackMs = parseDurationToSec(currentTrack?.duration) * 1000;
 
-  const stepTrack = (direction: 1 | -1) => {
+  const stepTrack = useCallback((direction: 1 | -1) => {
     setState((current) => {
       if (current.tracks.length <= 1) {
-        return {
-          ...current,
-          positionMs: 0,
-        };
+        return current;
       }
 
       let nextIndex = current.currentIndex;
@@ -129,92 +211,78 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
       return {
         ...current,
         currentIndex: nextIndex,
-        positionMs: 0,
       };
     });
-  };
+    // Reset position when the track changes
+    setPosition((prev) => ({ ...prev, positionMs: 0 }));
+  }, []);
 
   useEffect(() => {
     let disposed = false;
 
     const loadSound = async () => {
       if (soundRef.current) {
-        await soundRef.current.unloadAsync();
+        soundRef.current.destroy();
         soundRef.current = null;
       }
 
       if (!currentTrack?.audioUrl) {
-        setState((current) => ({
-          ...current,
-          durationMs: durationFallbackMs,
-        }));
+        setPosition((prev) => ({ ...prev, durationMs: durationFallbackMs }));
         return;
       }
 
-      const { sound, status } = await Audio.Sound.createAsync(
-        { uri: currentTrack.audioUrl },
-        {
-          shouldPlay: false,
-          progressUpdateIntervalMillis: 500,
-        },
-        (event: AVPlaybackStatus) => {
-          if (!event.isLoaded) {
+      const player = createPlayer(currentTrack.audioUrl, (event) => {
+        // Bail out if the displayed second hasn't changed and duration is same —
+        // this skips the ~3 sub-second timeupdate events per second, preventing
+        // the entire context from re-rendering every 250ms.
+        setPosition((prev) => {
+          const newPos = event.positionMs;
+          const newDur = event.durationMs ?? prev.durationMs;
+          if (
+            Math.floor(newPos / 1000) === Math.floor(prev.positionMs / 1000) &&
+            newDur === prev.durationMs
+          ) {
+            return prev; // same reference → React skips the re-render
+          }
+          return { positionMs: newPos, durationMs: newDur };
+        });
+
+        if (event.didJustFinish) {
+          if (repeatRef.current) {
+            soundRef.current?.seekTo(0);
+            setPosition((prev) => ({ ...prev, positionMs: 0 }));
+            if (playingRef.current) {
+              soundRef.current?.play();
+            }
             return;
           }
 
-          setState((current) => ({
-            ...current,
-            positionMs: event.positionMillis ?? 0,
-            durationMs: event.durationMillis ?? durationFallbackMs,
-          }));
-
-          if (event.didJustFinish) {
-            if (repeatRef.current) {
-              soundRef.current?.setPositionAsync(0).then(() => {
-                if (playingRef.current) {
-                  soundRef.current?.playAsync();
-                }
-              });
-              return;
+          setPosition((prev) => ({ ...prev, positionMs: 0 }));
+          setState((current) => {
+            if (current.tracks.length <= 1) {
+              return { ...current, playing: false };
             }
 
-            setState((current) => {
-              if (current.tracks.length <= 1) {
-                return { ...current, positionMs: 0, playing: false };
+            let nextIndex = current.currentIndex;
+            if (shuffleRef.current) {
+              while (nextIndex === current.currentIndex) {
+                nextIndex = Math.floor(Math.random() * current.tracks.length);
               }
+            } else {
+              nextIndex = (current.currentIndex + 1) % current.tracks.length;
+            }
 
-              let nextIndex = current.currentIndex;
-              if (shuffleRef.current) {
-                while (nextIndex === current.currentIndex) {
-                  nextIndex = Math.floor(Math.random() * current.tracks.length);
-                }
-              } else {
-                nextIndex = (current.currentIndex + 1) % current.tracks.length;
-              }
-
-              return {
-                ...current,
-                currentIndex: nextIndex,
-                positionMs: 0,
-              };
-            });
-          }
+            return { ...current, currentIndex: nextIndex };
+          });
         }
-      );
+      });
 
       if (disposed) {
-        await sound.unloadAsync();
+        player.destroy();
         return;
       }
 
-      soundRef.current = sound;
-      if (status.isLoaded) {
-        setState((current) => ({
-          ...current,
-          positionMs: status.positionMillis ?? 0,
-          durationMs: status.durationMillis ?? durationFallbackMs,
-        }));
-      }
+      soundRef.current = player;
     };
 
     if (!currentTrack) {
@@ -226,7 +294,7 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
     return () => {
       disposed = true;
       if (soundRef.current) {
-        soundRef.current.unloadAsync().catch(() => undefined);
+        soundRef.current.destroy();
         soundRef.current = null;
       }
     };
@@ -238,145 +306,164 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
     }
 
     if (state.playing) {
-      soundRef.current.playAsync().catch(() => undefined);
+      soundRef.current.play();
       return;
     }
 
-    soundRef.current.pauseAsync().catch(() => undefined);
+    soundRef.current.pause();
   }, [currentTrack, state.playing]);
 
-  useEffect(() => {
+  // Fake tick for tracks that have no real audioUrl (preview / demo mode)
+  const fakeTickEffect = useCallback(() => {
     if (!currentTrack || currentTrack.audioUrl || !state.playing) {
       return;
     }
 
     const interval = setInterval(() => {
-      setState((current) => {
-        const activeDuration = current.durationMs || durationFallbackMs;
-        const nextPosition = current.positionMs + 1000;
+      setPosition((prev) => {
+        const activeDuration = prev.durationMs || durationFallbackMs;
+        const nextPosition = prev.positionMs + 1000;
 
         if (nextPosition < activeDuration) {
-          return { ...current, positionMs: nextPosition };
+          return { ...prev, positionMs: nextPosition };
         }
 
-        if (current.repeatEnabled) {
-          return { ...current, positionMs: 0 };
-        }
-
-        if (current.tracks.length <= 1) {
-          return { ...current, positionMs: activeDuration, playing: false };
-        }
-
-        let nextIndex = current.currentIndex;
-        if (current.shuffleEnabled) {
-          while (nextIndex === current.currentIndex) {
-            nextIndex = Math.floor(Math.random() * current.tracks.length);
+        // Track ended or loop
+        setState((current) => {
+          if (current.repeatEnabled) {
+            return current;
           }
-        } else {
-          nextIndex = (current.currentIndex + 1) % current.tracks.length;
-        }
 
-        return {
-          ...current,
-          currentIndex: nextIndex,
-          positionMs: 0,
-        };
+          if (current.tracks.length <= 1) {
+            return { ...current, playing: false };
+          }
+
+          let nextIndex = current.currentIndex;
+          if (current.shuffleEnabled) {
+            while (nextIndex === current.currentIndex) {
+              nextIndex = Math.floor(Math.random() * current.tracks.length);
+            }
+          } else {
+            nextIndex = (current.currentIndex + 1) % current.tracks.length;
+          }
+
+          return { ...current, currentIndex: nextIndex };
+        });
+
+        return { ...prev, positionMs: 0 };
       });
     }, 1000);
 
     return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentTrack, durationFallbackMs, state.playing]);
+
+  useEffect(fakeTickEffect, [fakeTickEffect]);
+
+  const setSession = useCallback((
+    {
+      sessionId,
+      tracks,
+      initialTrackIndex = 0,
+      initialProgressPercent = 0,
+      autoplay = false,
+    }: SetSessionPayload
+  ) => {
+    if (tracks.length === 0) {
+      return;
+    }
+
+    const boundedIndex = Math.max(
+      0,
+      Math.min(initialTrackIndex, tracks.length - 1)
+    );
+    const durationMs = parseDurationToSec(tracks[boundedIndex].duration) * 1000;
+    const positionMs = Math.round(
+      (Math.max(0, Math.min(initialProgressPercent, 100)) / 100) * durationMs
+    );
+
+    setPosition({ positionMs, durationMs });
+    setState((current) => ({
+      ...current,
+      sessionId,
+      tracks,
+      currentIndex: boundedIndex,
+      playing: autoplay ? true : current.playing && current.sessionId === sessionId,
+    }));
+  }, []);
+
+  const togglePlay = useCallback(() => {
+    setState((current) => ({ ...current, playing: !current.playing }));
+  }, []);
+
+  const seekToRatio = useCallback((ratio: number) => {
+    const clampedRatio = Math.max(0, Math.min(ratio, 1));
+    const targetMs = Math.round(positionRef.current.durationMs * clampedRatio);
+    setPosition((prev) => ({ ...prev, positionMs: targetMs }));
+    // setState returning `current` = no state change; used only to safely
+    // read current track and fire the imperative seekTo call.
+    setState((current) => {
+      if (soundRef.current && current.tracks[current.currentIndex]?.audioUrl) {
+        soundRef.current.seekTo(targetMs / 1000);
+      }
+      return current;
+    });
+  }, []);
+
+  const toggleShuffle = useCallback(() => {
+    setState((current) => ({ ...current, shuffleEnabled: !current.shuffleEnabled }));
+  }, []);
+
+  const toggleRepeat = useCallback(() => {
+    setState((current) => ({ ...current, repeatEnabled: !current.repeatEnabled }));
+  }, []);
+
+  const toggleFavorite = useCallback(() => {
+    setState((current) => ({ ...current, favoriteEnabled: !current.favoriteEnabled }));
+  }, []);
+
+  const toggleQueue = useCallback(() => {
+    setState((current) => ({ ...current, queueEnabled: !current.queueEnabled }));
+  }, []);
+
+  const setIsVisible = useCallback((visible: boolean) => {
+    setState((current) => ({ ...current, isVisible: visible }));
+  }, []);
 
   const value = useMemo<NowPlayingContextValue>(
     () => ({
       state,
+      positionMs: position.positionMs,
+      durationMs: position.durationMs,
       currentTrack,
-      setSession: ({
-        sessionId,
-        tracks,
-        initialTrackIndex = 0,
-        initialProgressPercent = 0,
-        autoplay = false,
-      }) => {
-        if (tracks.length === 0) {
-          return;
-        }
-
-        const boundedIndex = Math.max(
-          0,
-          Math.min(initialTrackIndex, tracks.length - 1)
-        );
-        const durationMs = parseDurationToSec(tracks[boundedIndex].duration) * 1000;
-        const positionMs = Math.round(
-          (Math.max(0, Math.min(initialProgressPercent, 100)) / 100) * durationMs
-        );
-
-        setState((current) => ({
-          ...current,
-          sessionId,
-          tracks,
-          currentIndex: boundedIndex,
-          durationMs,
-          positionMs,
-          playing: autoplay ? true : current.playing && current.sessionId === sessionId,
-        }));
-      },
-      togglePlay: () => {
-        setState((current) => ({ ...current, playing: !current.playing }));
-      },
+      hlsStream,
+      setHlsStream: setHlsStreamCallback,
+      registerHlsToggle,
+      toggleHlsPlay,
+      hlsAudioRef,
+      activeHlsUrl,
+      setActiveHlsUrl,
+      activeHlsTitle,
+      activeHlsArtist,
+      setActiveHlsMeta,
+      activeHlsPlaying,
+      setActiveHlsPlaying,
+      setSession,
+      togglePlay,
       nextTrack: () => stepTrack(1),
       previousTrack: () => stepTrack(-1),
-      seekToRatio: (ratio: number) => {
-        const clampedRatio = Math.max(0, Math.min(ratio, 1));
-
-        setState((current) => {
-          const activeDuration =
-            current.durationMs ||
-            parseDurationToSec(current.tracks[current.currentIndex]?.duration) * 1000;
-          const targetMs = Math.round(activeDuration * clampedRatio);
-
-          if (soundRef.current && current.tracks[current.currentIndex]?.audioUrl) {
-            soundRef.current.setPositionAsync(targetMs).catch(() => undefined);
-          }
-
-          return {
-            ...current,
-            positionMs: targetMs,
-          };
-        });
-      },
-      toggleShuffle: () => {
-        setState((current) => ({
-          ...current,
-          shuffleEnabled: !current.shuffleEnabled,
-        }));
-      },
-      toggleRepeat: () => {
-        setState((current) => ({
-          ...current,
-          repeatEnabled: !current.repeatEnabled,
-        }));
-      },
-      toggleFavorite: () => {
-        setState((current) => ({
-          ...current,
-          favoriteEnabled: !current.favoriteEnabled,
-        }));
-      },
-      toggleQueue: () => {
-        setState((current) => ({
-          ...current,
-          queueEnabled: !current.queueEnabled,
-        }));
-      },
-      setIsVisible: (visible: boolean) => {
-        setState((current) => ({
-          ...current,
-          isVisible: visible,
-        }));
-      },
+      seekToRatio,
+      toggleShuffle,
+      toggleRepeat,
+      toggleFavorite,
+      toggleQueue,
+      setIsVisible,
     }),
-    [currentTrack, state]
+    [currentTrack, hlsStream, hlsAudioRef, activeHlsUrl, setActiveHlsUrl,
+     activeHlsTitle, activeHlsArtist, setActiveHlsMeta, activeHlsPlaying, setActiveHlsPlaying, position,
+     setIsVisible, setSession, seekToRatio, state, stepTrack,
+     toggleFavorite, togglePlay, toggleQueue, toggleRepeat, toggleShuffle,
+     setHlsStreamCallback, registerHlsToggle, toggleHlsPlay]
   );
 
   return (
