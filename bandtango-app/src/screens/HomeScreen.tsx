@@ -195,7 +195,6 @@ export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
       </ImageBackground>
       <ScrollView contentContainerClassName="px-5 pb-9">
         <View className="mb-4 mt-4">
-          <Text className="mb-2 text-sm font-semibold text-[#E2E8F0]">Album</Text>
           <View className="h-64 overflow-hidden rounded-2xl border border-[#334155] bg-[#111827]">
             {featuredTrack?.albumArtUrl ? (
               <Image
