@@ -1,5 +1,7 @@
 import { Platform } from 'react-native';
 import { createPlayer, PlayerInstance } from '../utils/audioPlayer';
+import { PRESET_STREAMS, isCorsSafeUrl } from '../data/streamPresets';
+import { fetchIcyMeta } from '../utils/icyMetadata';
 import {
   createContext,
   ReactNode,
@@ -21,6 +23,48 @@ export type PlayerTrack = {
 export type HlsStreamInfo = {
   elapsedSec: number;
 };
+
+// ── Context-level stream metadata fetcher ───────────────────────────────────────────
+// Runs independently of any mounted LivePlayerCard so the MiniBar stays fresh
+// even when navigating between screens.
+const SOMA_IDS: Record<string, string> = Object.fromEntries(
+  PRESET_STREAMS
+    .filter((s) => s.url.includes('somafm.com'))
+    .map((s) => [s.url, s.url.match(/\/([a-zA-Z]+)-\d/)?.[1] ?? ''])
+);
+
+async function fetchContextMeta(url: string): Promise<{ title: string; artist: string } | null> {
+  // ── SomaFM JSON API ──────────────────────────────────────────────────
+  const somaId = SOMA_IDS[url];
+  if (somaId) {
+    try {
+      const res = await fetch(`https://api.somafm.com/songs/${somaId}.json`);
+      if (res.ok) {
+        const data = await res.json() as { songs?: { artist?: string; title?: string }[] };
+        const song = data?.songs?.[0];
+        if (song) return { artist: song.artist ?? 'Unknown Artist', title: song.title ?? '' };
+      }
+    } catch { /* network unavailable */ }
+    return null;
+  }
+
+  // ── HLS M3U8 ────────────────────────────────────────────────────────────
+  // LivePlayerCard owns all HLS metadata parsing and positional track updates.
+  // The context poll must NOT attempt to read the M3U8 here, because it would
+  // always extract Track 1 from the comment-block and overwrite whatever track
+  // the position-based effect in LivePlayerCard has correctly resolved — causing
+  // the artist/title to flicker back to Track 1 every 20 s.
+  if (/\.m3u8/i.test(url)) return null;
+
+  // ── Icecast / ShoutCast: ICY byte-offset metadata ─────────────────────
+  // Only attempt the streaming fetch for origins that are verified to send
+  // CORS headers — avoids a wasted 12 s timeout on CORS-blocked servers.
+  if (isCorsSafeUrl(url)) {
+    const icy = await fetchIcyMeta(url);
+    if (icy) return { title: icy.title, artist: icy.artist };
+  }
+  return null;
+}
 
 type SetSessionPayload = {
   sessionId: string;
@@ -155,6 +199,30 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
   }, []);  // setState setters are stable — no deps needed
   // Persisted audio element — lives for the lifetime of the provider, not the card.
   const hlsAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // ── Background metadata polling ──────────────────────────────────────────────
+  // Keeps title/artist fresh in context regardless of which LivePlayerCard (if
+  // any) is currently mounted. LivePlayerCard's own polling takes precedence for
+  // multi-track VOD playlists (positional switching) — this handles live presets
+  // and any stream not covered by a mounted card.
+  const ctxMetaPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  useEffect(() => {
+    if (ctxMetaPollRef.current) { clearInterval(ctxMetaPollRef.current); ctxMetaPollRef.current = null; }
+    if (!activeHlsUrl) return;
+    const poll = () =>
+      fetchContextMeta(activeHlsUrl).then((m) => {
+        if (m) {
+          setActiveHlsTitleState(m.title);
+          setActiveHlsArtistState(m.artist);
+        }
+      });
+    // Delay the first context poll slightly so a freshly-mounted LivePlayerCard
+    // (which has more detailed parsing) gets to run first.
+    const initial = setTimeout(poll, 3_000);
+    const interval = setInterval(poll, 20_000);
+    ctxMetaPollRef.current = interval;
+    return () => { clearTimeout(initial); clearInterval(interval); };
+  }, [activeHlsUrl]);
   // Ref to the play/pause toggle function registered by HLSListeningScreen
   const hlsToggleRef = useRef<(() => void) | null>(null);
   const setHlsStreamCallback = useCallback((info: HlsStreamInfo | null) => {

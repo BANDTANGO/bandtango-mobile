@@ -3,6 +3,7 @@ import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Animated, Image, ImageBackground, Pressable, ScrollView, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { LivePlayerCard } from '../components/LivePlayerCard';
+import { PRESET_STREAMS } from '../data/streamPresets';
 import { Playlist, MainStackParamList } from '../types';
 import { useNowPlaying } from '../state/NowPlayingContext';
 
@@ -104,7 +105,7 @@ type HomeScreenProps = NativeStackScreenProps<MainStackParamList, 'Home'> & {
 };
 
 export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
-  const { activeHlsTitle, activeHlsArtist, activeHlsPlaying } = useNowPlaying();
+  const { activeHlsTitle, activeHlsArtist, activeHlsPlaying, activeHlsUrl } = useNowPlaying();
   const [albumArtUrl, setAlbumArtUrl] = useState<string | null>(null);
   navigation.setOptions({
     headerRight: () => (
@@ -153,6 +154,20 @@ export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
 
   const featuredTrack = tracks[0];
 
+  // ── Resolve which URL the LivePlayerCard should use ──────────────────────────
+  // If a preset station or custom HLS stream was started on HLSListeningScreen
+  // and is still active (activeHlsUrl differs from the local playlist URL),
+  // show THAT stream in the card so metadata stays in sync. However, if the
+  // user explicitly navigated to a playlist that has its own stream URL, that
+  // intent always wins — don't let a previously-active external stream override it.
+  const localUrl = featuredTrack?.audioUrl ?? '';
+  const isExternalStreamActive = !selectedPlaylist?.url && !!activeHlsUrl && activeHlsUrl !== localUrl;
+  const cardUrl = isExternalStreamActive ? activeHlsUrl : localUrl;
+  const activePreset = PRESET_STREAMS.find((s) => s.url === cardUrl);
+  const cardLabel        = activePreset?.label ?? featuredTrack?.title;
+  const cardInitialTitle = activePreset?.label ?? featuredTrack?.title;
+  const cardInitialArtist = activePreset ? '' : featuredTrack?.artist;
+
   // ── Album art lookup ────────────────────────────────────────────────────
   // Prefer live stream metadata (title/artist from the HLS stream parser) over
   // static track data, so the art updates as the stream progresses.
@@ -195,10 +210,10 @@ export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
         </View>
 
         <LivePlayerCard
-          url={featuredTrack?.audioUrl ?? ''}
-          label={featuredTrack?.title}
-          initialTitle={featuredTrack?.title}
-          initialArtist={featuredTrack?.artist}
+          url={cardUrl}
+          label={cardLabel}
+          initialTitle={cardInitialTitle}
+          initialArtist={cardInitialArtist}
         />
       </ScrollView>
     </View>

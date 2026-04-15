@@ -8,6 +8,10 @@ import { useNowPlaying } from '../state/NowPlayingContext';
 interface TrackMeta {
   artist: string;
   title: string;
+  /** Full ordered track list parsed from a comment-block (e.g. # Track N: …). */
+  tracks?: Array<{ artist: string; title: string }>;
+  /** Sum of all #EXTINF durations in seconds — used for positional track lookup. */
+  totalDurationSec?: number;
 }
 
 /** SomaFM channel IDs baked in so the card can self-identify and poll their API. */
@@ -31,26 +35,40 @@ async function fetchSomaFmMeta(channelId: string): Promise<TrackMeta | null> {
 }
 
 async function fetchHlsMeta(playlistUrl: string): Promise<TrackMeta | null> {
-  const base = playlistUrl.replace(/\/[^/]+\.m3u8.*$/, '');
-
-  // 1. Sidecar nowplaying.json
-  try {
-    const res = await fetch(`${base}/nowplaying.json`, { cache: 'no-store' });
-    if (res.ok) {
-      const data = await res.json() as Record<string, unknown>;
-      const song = (data.song as Record<string, unknown>) ?? data;
-      const artist = (song.artist ?? data.artist ?? '') as string;
-      const title  = (song.title  ?? data.title  ?? '') as string;
-      if (artist || title) return { artist: artist || 'Unknown Artist', title: title || 'Live Stream' };
-    }
-  } catch { /* no sidecar */ }
-
-  // 2. Parse the M3U8 playlist
+  // Parse the M3U8 playlist
   try {
     const res = await fetch(playlistUrl, { cache: 'no-store' });
     if (!res.ok) return null;
     const text  = await res.text();
     const lines = text.split('\n').map((l) => l.trim());
+
+    // ── Comment-block track list: # Track N: Artist - Title [Album] ──────
+    // This is a custom server format where each track is listed in a comment
+    // header block. We also sum #EXTINF durations to compute relative positions.
+    const commentTracks: Array<{ artist: string; title: string }> = [];
+    for (const line of lines) {
+      const m = line.match(/^#\s+Track\s+\d+:\s*(.+)$/);
+      if (!m) continue;
+      const raw     = m[1].trim().replace(/\s*\[[^\]]+\]\s*$/, '').trim(); // strip [Album]
+      const dash    = raw.indexOf(' - ');
+      commentTracks.push({
+        artist: dash !== -1 ? raw.slice(0, dash).trim() : '',
+        title:  dash !== -1 ? raw.slice(dash + 3).trim() : raw,
+      });
+    }
+    if (commentTracks.length > 0) {
+      let totalDurationSec = 0;
+      for (const line of lines) {
+        const m = line.match(/^#EXTINF:([\d.]+)/);
+        if (m) totalDurationSec += parseFloat(m[1]);
+      }
+      return {
+        artist: commentTracks[0].artist,
+        title:  commentTracks[0].title,
+        tracks: commentTracks,
+        totalDurationSec: Math.round(totalDurationSec),
+      };
+    }
 
     // Comment-style ID3 block: # TITLE: ... / # ARTIST: ...
     let commentTitle  = '';
@@ -268,9 +286,11 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
       if (m) {
         setTrackMeta(m);
         setTrackMetaUrl(url);
-        // Push resolved title/artist to context so MiniBar and album art
-        // consume a single stable source that only changes on real updates.
-        setActiveHlsMeta(m.title, m.artist);
+        // For multi-track VOD playlists the position-based effect below updates
+        // the MiniBar on each second tick — don't overwrite with the first track.
+        if (!m.tracks?.length) {
+          setActiveHlsMeta(m.title, m.artist);
+        }
       }
     });
     poll();
@@ -278,6 +298,19 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     metaTimer.current = setInterval(poll, interval);
     return () => { if (metaTimer.current) clearInterval(metaTimer.current); };
   }, [url]);
+
+  // ── Position-based track selection ───────────────────────────────────────
+  // When the playlist carries a comment-block track list with a known total
+  // duration, derive the currently-playing title/artist from elapsed time so
+  // the MiniBar updates as each song changes without any extra network calls.
+  useEffect(() => {
+    const tracks = trackMetaUrl === url ? trackMeta?.tracks : undefined;
+    const total  = trackMeta?.totalDurationSec;
+    if (!tracks?.length || !total || total === 0) return;
+    const idx     = Math.min(Math.floor((elapsedSec / total) * tracks.length), tracks.length - 1);
+    const current = tracks[idx];
+    setActiveHlsMeta(current.title, current.artist);
+  }, [elapsedSec, trackMeta, trackMetaUrl, url, setActiveHlsMeta]);
 
   // ── MiniBar toggle registration ──────────────────────────────────────────────
   // Register a toggle that directly controls the persisted audio element so
@@ -319,8 +352,19 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
 
   if (!url) return null;
 
-  const displayTitle  = trackMeta?.title  ?? initialTitle  ?? 'Live Stream';
-  const displayArtist = trackMeta?.artist ?? initialArtist ?? '';
+  // When the playlist carries a multi-track list, derive the currently-playing
+  // track by position so the card title/artist updates as each song changes —
+  // identical logic to the setActiveHlsMeta effect above.
+  const currentTrackEntry = (() => {
+    const tracks = trackMetaUrl === url ? trackMeta?.tracks : undefined;
+    const total  = trackMeta?.totalDurationSec;
+    if (!tracks?.length || !total || total === 0) return null;
+    const idx = Math.min(Math.floor((elapsedSec / total) * tracks.length), tracks.length - 1);
+    return tracks[idx];
+  })();
+
+  const displayTitle  = currentTrackEntry?.title  ?? trackMeta?.title  ?? initialTitle  ?? 'Live Stream';
+  const displayArtist = currentTrackEntry?.artist ?? trackMeta?.artist ?? initialArtist ?? '';
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (

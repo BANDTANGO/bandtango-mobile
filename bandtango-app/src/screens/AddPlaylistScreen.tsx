@@ -2,6 +2,7 @@ import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useState } from 'react';
 import {
+  ActivityIndicator,
   ImageBackground,
   Pressable,
   ScrollView,
@@ -10,11 +11,153 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { MainStackParamList } from '../types';
+import { MainStackParamList, Song } from '../types';
 
 type AddPlaylistScreenProps = NativeStackScreenProps<MainStackParamList, 'AddPlaylist'> & {
-  onCreatePlaylist: (payload: { name: string; description: string; url?: string }) => void;
+  onCreatePlaylist: (payload: { name: string; description: string; url?: string; songs?: Song[] }) => void;
 };
+
+// ── URL probe ─────────────────────────────────────────────────────────────────
+
+type ProbeResult =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'ok'; label: string; songs: Song[] };
+
+/** Parse an M3U8 body into individual track entries (empty array for live/master). */
+function parseM3u8Tracks(text: string): Song[] {
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+
+  // Master playlist — multiple bitrate renditions, not individual songs.
+  if (lines.some((l) => l.startsWith('#EXT-X-STREAM-INF'))) return [];
+
+  // ── Strategy 1: comment-block track list ──────────────────────────────────
+  // Servers may emit a header like:
+  //   # Track 1: Dave Matthews Band - Where Are You Going [Busted Stuff]
+  //   # Track 2: The Lumineers - Life in the City [III]
+  // Extract these when #EXTINF entries carry no inline labels.
+  const commentTracks: Array<{ artist: string; title: string }> = [];
+  let totalExtinfSec = 0;
+  for (const line of lines) {
+    const cm = line.match(/^#\s+Track\s+\d+:\s*(.+)$/);
+    if (cm) {
+      const raw     = cm[1].trim().replace(/\s*\[[^\]]+\]\s*$/, '').trim(); // strip [Album]
+      const dash    = raw.indexOf(' - ');
+      commentTracks.push({
+        artist: dash !== -1 ? raw.slice(0, dash).trim() : '',
+        title:  dash !== -1 ? raw.slice(dash + 3).trim() : raw,
+      });
+    }
+    const em = line.match(/^#EXTINF:([\d.]+)/);
+    if (em) totalExtinfSec += parseFloat(em[1]);
+  }
+
+  // ── Strategy 2: inline #EXTINF labels ────────────────────────────────────
+  const songs: Song[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith('#EXTINF:')) continue;
+
+    const raw = line.slice('#EXTINF:'.length);
+    const commaIdx = raw.indexOf(',');
+    const durationSec = commaIdx !== -1 ? parseFloat(raw.slice(0, commaIdx)) : NaN;
+    const label = commaIdx !== -1 ? raw.slice(commaIdx + 1).trim() : '';
+
+    // Skip if no meaningful label — comment-block strategy will handle it
+    if (!label) continue;
+
+    const durationStr =
+      !isNaN(durationSec) && durationSec > 0
+        ? `${Math.floor(durationSec / 60)}:${String(Math.floor(durationSec % 60)).padStart(2, '0')}`
+        : '--:--';
+
+    let title = label;
+    let artist = '';
+    const dash = label.indexOf(' - ');
+    if (dash !== -1) {
+      artist = label.slice(0, dash).trim();
+      title  = label.slice(dash + 3).trim();
+    }
+
+    let audioUrl: string | undefined;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (!lines[j].startsWith('#')) { audioUrl = lines[j]; break; }
+    }
+
+    songs.push({
+      id: `imported-${Date.now()}-${songs.length}`,
+      title,
+      artist,
+      duration: durationStr,
+      audioUrl,
+    });
+  }
+
+  // Prefer inline-label songs; fall back to comment-block tracks
+  if (songs.length > 0) return songs;
+
+  if (commentTracks.length > 0) {
+    const perTrackSec = totalExtinfSec > 0 ? totalExtinfSec / commentTracks.length : 0;
+    const durationStr = perTrackSec > 0
+      ? `${Math.floor(perTrackSec / 60)}:${String(Math.floor(perTrackSec % 60)).padStart(2, '0')}`
+      : '--:--';
+    return commentTracks.map((t, i) => ({
+      id: `imported-${Date.now()}-${i}`,
+      title: t.title,
+      artist: t.artist,
+      duration: durationStr,
+      audioUrl: undefined,
+    }));
+  }
+
+  return [];
+}
+
+async function probeUrl(rawUrl: string): Promise<ProbeResult> {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return { status: 'idle' };
+
+  try {
+    const res = await fetch(trimmed, { method: 'GET', cache: 'no-store' });
+    if (!res.ok) return { status: 'error', message: `Server returned ${res.status}` };
+
+    const contentType = res.headers.get('content-type') ?? '';
+    const isM3u8 =
+      /\.m3u8/i.test(trimmed) ||
+      contentType.includes('mpegurl') ||
+      contentType.includes('x-scpls') ||
+      contentType.includes('audio/x-mpegurl');
+
+    if (isM3u8) {
+      const text = await res.text();
+      const songs = parseM3u8Tracks(text);
+
+      // Detect live vs VOD
+      const isLive =
+        text.includes('#EXT-X-STREAM-INF') ||
+        !text.includes('#EXT-X-ENDLIST');
+
+      if (songs.length > 0) {
+        return {
+          status: 'ok',
+          label: `HLS Playlist · ${songs.length} track${songs.length !== 1 ? 's' : ''} detected`,
+          songs,
+        };
+      }
+      return {
+        status: 'ok',
+        label: isLive ? 'HLS Live Stream' : 'HLS On-Demand Stream',
+        songs: [],
+      };
+    }
+
+    // Plain audio stream / unknown
+    return { status: 'ok', label: 'Stream URL · no tracks detected', songs: [] };
+  } catch (e) {
+    return { status: 'error', message: 'Could not reach URL — check the address and try again.' };
+  }
+}
 
 const GENRE_TAGS = ['Rock', 'Hip-Hop', 'Jazz', 'Electronic', 'R&B', 'Pop', 'Country', 'Classical', 'Indie', 'Metal'];
 const MOOD_TAGS  = ['Chill', 'Hype', 'Focus', 'Workout', 'Sad', 'Happy', 'Late Night', 'Morning'];
@@ -30,6 +173,15 @@ export function AddPlaylistScreen({ navigation, onCreatePlaylist }: AddPlaylistS
   const [descFocused, setDescFocused] = useState(false);
   const [urlFocused, setUrlFocused]   = useState(false);
   const [error, setError]             = useState('');
+  const [probe, setProbe]             = useState<ProbeResult>({ status: 'idle' });
+
+  const handleUrlBlur = async () => {
+    setUrlFocused(false);
+    const trimmed = url.trim();
+    if (!trimmed) { setProbe({ status: 'idle' }); return; }
+    setProbe({ status: 'loading' });
+    setProbe(await probeUrl(trimmed));
+  };
 
   const toggleTag = (list: string[], setList: (v: string[]) => void, tag: string) => {
     setList(list.includes(tag) ? list.filter((t) => t !== tag) : [...list, tag]);
@@ -40,7 +192,12 @@ export function AddPlaylistScreen({ navigation, onCreatePlaylist }: AddPlaylistS
       setError('Playlist name is required.');
       return;
     }
-    onCreatePlaylist({ name: name.trim(), description: description.trim() || 'No description yet', url: url.trim() || undefined });
+    onCreatePlaylist({
+      name: name.trim(),
+      description: description.trim() || 'No description yet',
+      url: url.trim() || undefined,
+      songs: probe.status === 'ok' ? probe.songs : [],
+    });
     navigation.goBack();
   };
 
@@ -127,15 +284,35 @@ export function AddPlaylistScreen({ navigation, onCreatePlaylist }: AddPlaylistS
             cursorColor="#F8FAFC"
             underlineColorAndroid="transparent"
             onFocus={() => setUrlFocused(true)}
-            onBlur={() => setUrlFocused(false)}
+            onBlur={handleUrlBlur}
             style={{ flex: 1, color: '#F8FAFC', fontSize: 14, outline: 'none' } as any}
           />
           {!!url && (
-            <Pressable onPress={() => setUrl('')}>
+            <Pressable onPress={() => { setUrl(''); setProbe({ status: 'idle' }); }}>
               <Ionicons name="close-circle" size={15} color="#64748B" />
             </Pressable>
           )}
         </View>
+
+        {/* URL probe result */}
+        {probe.status === 'loading' && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 }}>
+            <ActivityIndicator size="small" color="#00CAF5" />
+            <Text style={{ color: '#64748B', fontSize: 13 }}>Checking URL…</Text>
+          </View>
+        )}
+        {probe.status === 'error' && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 }}>
+            <Ionicons name="alert-circle-outline" size={15} color="#F87171" />
+            <Text style={{ color: '#F87171', fontSize: 13, flex: 1 }}>{probe.message}</Text>
+          </View>
+        )}
+        {probe.status === 'ok' && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 }}>
+            <Ionicons name="checkmark-circle-outline" size={15} color="#34D399" />
+            <Text style={{ color: '#34D399', fontSize: 13 }}>{probe.label}</Text>
+          </View>
+        )}
 
         {/* Genre tags */}
         <Text style={{ color: '#E2E8F0', fontSize: 13, fontWeight: '600', marginTop: 16, marginBottom: 8 }}>Genre</Text>

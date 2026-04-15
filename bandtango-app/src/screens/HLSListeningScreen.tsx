@@ -11,14 +11,17 @@ import {
   View,
 } from 'react-native';
 import { LivePlayerCard } from '../components/LivePlayerCard';
+import { PRESET_STREAMS, StreamType, addCorsSafeOrigin } from '../data/streamPresets';
 import { MainStackParamList } from '../types';
 import { useNowPlaying } from '../state/NowPlayingContext';
 
-const PRESET_STREAMS = [
-  { label: 'SomaFM Groove Salad', url: 'https://ice1.somafm.com/groovesalad-128-aac' },
-  { label: 'SomaFM Space Station', url: 'https://ice1.somafm.com/spacestation-128-aac' },
-  { label: 'SomaFM Secret Agent', url: 'https://ice1.somafm.com/secretagent-128-aac' },
-];
+type UserPreset = { label: string; url: string; type: StreamType; corsOk: boolean };
+
+function detectStreamType(url: string): StreamType {
+  const lower = url.toLowerCase();
+  if (lower.includes('.m3u8') || lower.includes('.m3u') || lower.includes('/hls/')) return 'hls';
+  return 'icecast';
+}
 
 type Props = NativeStackScreenProps<MainStackParamList, 'HLSListening'>;
 
@@ -26,9 +29,18 @@ export function HLSListeningScreen(_props: Props) {
   const { setActiveHlsUrl, activeHlsUrl } = useNowPlaying();
   const [urlInput, setUrlInput] = useState('');
   const [focused, setFocused] = useState(false);
+  const [userPresets, setUserPresets] = useState<UserPreset[]>([]);
+  const [savingPreset, setSavingPreset] = useState(false);
+  const [presetLabel, setPresetLabel] = useState('');
+  const [presetLabelFocused, setPresetLabelFocused] = useState(false);
+  const [presetType, setPresetType] = useState<StreamType>('icecast');
+  const [presetCorsOk, setPresetCorsOk] = useState(false);
 
   // Use context's activeHlsUrl as the source of truth for what's streaming.
   const activeUrl = activeHlsUrl;
+
+  const allPresets = [...PRESET_STREAMS, ...userPresets];
+  const isAlreadyPreset = !!activeUrl && allPresets.some((p) => p.url === activeUrl);
 
   const handleStart = (url?: string) => {
     const target = (url ?? urlInput).trim();
@@ -38,6 +50,28 @@ export function HLSListeningScreen(_props: Props) {
 
   const handleStop = () => {
     setActiveHlsUrl('');
+    setSavingPreset(false);
+  };
+
+  const beginSavePreset = () => {
+    const existing = allPresets.find((p) => p.url === activeUrl);
+    setPresetLabel(existing?.label ?? activeUrl ?? '');
+    setPresetType((existing as UserPreset | undefined)?.type ?? detectStreamType(activeUrl ?? ''));
+    setPresetCorsOk((existing as UserPreset | undefined)?.corsOk ?? false);
+    setSavingPreset(true);
+  };
+
+  const confirmSavePreset = () => {
+    const label = presetLabel.trim();
+    const url   = activeUrl;
+    if (!label || !url) { setSavingPreset(false); return; }
+    if (presetCorsOk) addCorsSafeOrigin(url);
+    setUserPresets((prev) => [...prev, { label, url, type: presetType, corsOk: presetCorsOk }]);
+    setSavingPreset(false);
+  };
+
+  const removeUserPreset = (url: string) => {
+    setUserPresets((prev) => prev.filter((p) => p.url !== url));
   };
 
   return (
@@ -54,17 +88,8 @@ export function HLSListeningScreen(_props: Props) {
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 40, paddingTop: 16 }}
         keyboardShouldPersistTaps="handled"
       >
-        <View style={{ marginBottom: 20 }}>
-          <Text style={{ color: '#F8FAFC', fontSize: 20, fontWeight: '700' }}>
-            HLS Live Listening
-          </Text>
-          <Text style={{ color: '#94A3B8', fontSize: 13, marginTop: 4 }}>
-            Paste any HLS or audio stream URL and hit play.
-          </Text>
-        </View>
-
         <Text style={{ color: '#94A3B8', fontSize: 11, fontWeight: '600', letterSpacing: 0.5, marginBottom: 6 }}>
-          STREAM URL
+            Paste any audio stream URL and hit play.
         </Text>
         <View
           style={{
@@ -110,31 +135,151 @@ export function HLSListeningScreen(_props: Props) {
           )}
         </View>
 
-        {/* Start / Stop button */}
-        <Pressable
-          onPress={() => (activeUrl ? handleStop() : handleStart())}
-          style={({ pressed }) => ({
-            borderRadius: 12,
-            backgroundColor: activeUrl
-              ? (pressed ? '#7f1d1d' : '#991b1b')
-              : (pressed ? '#0099c4' : '#00CAF5'),
-            paddingVertical: 14,
-            alignItems: 'center',
-            marginBottom: 24,
-            flexDirection: 'row',
-            justifyContent: 'center',
-            gap: 8,
-          })}
-        >
-          <Ionicons
-            name={activeUrl ? 'stop-circle-outline' : 'play-circle-outline'}
-            size={20}
-            color={activeUrl ? '#FCA5A5' : '#0F172A'}
-          />
-          <Text style={{ color: activeUrl ? '#FCA5A5' : '#0F172A', fontSize: 15, fontWeight: '700' }}>
-            {activeUrl ? 'Stop Stream' : 'Start Streaming'}
-          </Text>
-        </Pressable>
+        {/* Start / Stop + Save as Preset */}
+        <View style={{ flexDirection: 'row', gap: 8, marginBottom: savingPreset ? 12 : 24 }}>
+          <Pressable
+            onPress={() => (activeUrl ? handleStop() : handleStart())}
+            style={({ pressed }) => ({
+              flex: 1,
+              borderRadius: 12,
+              backgroundColor: activeUrl
+                ? (pressed ? '#7f1d1d' : '#991b1b')
+                : (pressed ? '#0099c4' : '#00CAF5'),
+              paddingVertical: 14,
+              alignItems: 'center',
+              flexDirection: 'row',
+              justifyContent: 'center',
+              gap: 8,
+            })}
+          >
+            <Ionicons
+              name={activeUrl ? 'stop-circle-outline' : 'play-circle-outline'}
+              size={20}
+              color={activeUrl ? '#FCA5A5' : '#0F172A'}
+            />
+            <Text style={{ color: activeUrl ? '#FCA5A5' : '#0F172A', fontSize: 15, fontWeight: '700' }}>
+              {activeUrl ? 'Stop Stream' : 'Start Streaming'}
+            </Text>
+          </Pressable>
+
+          {activeUrl && !isAlreadyPreset && (
+            <Pressable
+              onPress={beginSavePreset}
+              style={({ pressed }) => ({
+                borderRadius: 12,
+                borderWidth: 1,
+                borderColor: '#334155',
+                backgroundColor: pressed ? '#1E293B' : '#111827',
+                paddingHorizontal: 14,
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexDirection: 'row',
+                gap: 6,
+              })}
+            >
+              <Ionicons name="bookmark-outline" size={18} color="#00CAF5" />
+              <Text style={{ color: '#00CAF5', fontSize: 13, fontWeight: '600' }}>Save</Text>
+            </Pressable>
+          )}
+        </View>
+
+        {/* Inline preset-naming form */}
+        {savingPreset && (
+          <View style={{ marginBottom: 24, backgroundColor: '#111827', borderRadius: 12, borderWidth: 1, borderColor: '#334155', padding: 12, gap: 10 }}>
+            <Text style={{ color: '#94A3B8', fontSize: 12, fontWeight: '600' }}>Station name</Text>
+            <TextInput
+              value={presetLabel}
+              onChangeText={setPresetLabel}
+              placeholder="e.g. My Jazz Station"
+              placeholderTextColor="#475569"
+              autoCapitalize="words"
+              autoFocus
+              selectionColor="#00CAF5"
+              cursorColor="#00CAF5"
+              underlineColorAndroid="transparent"
+              onFocus={() => setPresetLabelFocused(true)}
+              onBlur={() => setPresetLabelFocused(false)}
+              style={{
+                color: '#F8FAFC',
+                fontSize: 14,
+                backgroundColor: '#0F172A',
+                borderRadius: 8,
+                borderWidth: 1,
+                borderColor: presetLabelFocused ? '#00CAF5' : '#334155',
+                paddingHorizontal: 12,
+                paddingVertical: 9,
+                ...(({ outline: 'none' }) as object),
+              }}
+            />
+            {/* Stream type selector */}
+            <Text style={{ color: '#94A3B8', fontSize: 12, fontWeight: '600' }}>Stream type</Text>
+            {/* CORS metadata polling toggle — only relevant for Icecast streams */}
+            {presetType === 'icecast' && (
+              <Pressable
+                onPress={() => setPresetCorsOk((v) => !v)}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6 }}
+              >
+                <View style={{
+                  width: 20, height: 20, borderRadius: 4, borderWidth: 1,
+                  borderColor: presetCorsOk ? '#00CAF5' : '#334155',
+                  backgroundColor: presetCorsOk ? 'rgba(0,202,245,0.15)' : 'transparent',
+                  alignItems: 'center', justifyContent: 'center',
+                }}>
+                  {presetCorsOk && <Ionicons name="checkmark" size={13} color="#00CAF5" />}
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ color: '#F8FAFC', fontSize: 13, fontWeight: '600' }}>Allow metadata polling (CORS)</Text>
+                  <Text style={{ color: '#64748B', fontSize: 11, marginTop: 2 }}>
+                    Enable only if this server sends CORS headers — lets us read artist/title from the stream.
+                  </Text>
+                </View>
+              </Pressable>
+            )}
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              {(['icecast', 'hls'] as StreamType[]).map((t) => (
+                <Pressable
+                  key={t}
+                  onPress={() => setPresetType(t)}
+                  style={{
+                    flex: 1,
+                    borderRadius: 8,
+                    borderWidth: 1,
+                    borderColor: presetType === t ? '#00CAF5' : '#334155',
+                    backgroundColor: presetType === t ? 'rgba(0,202,245,0.12)' : '#0F172A',
+                    paddingVertical: 9,
+                    alignItems: 'center',
+                    flexDirection: 'row',
+                    justifyContent: 'center',
+                    gap: 6,
+                  }}
+                >
+                  <Ionicons
+                    name={t === 'hls' ? 'layers-outline' : 'radio-outline'}
+                    size={15}
+                    color={presetType === t ? '#00CAF5' : '#64748B'}
+                  />
+                  <Text style={{ color: presetType === t ? '#00CAF5' : '#64748B', fontSize: 13, fontWeight: '600', textTransform: 'uppercase' }}>
+                    {t === 'hls' ? 'HLS' : 'Icecast'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <Pressable
+                onPress={confirmSavePreset}
+                style={{ flex: 1, borderRadius: 8, backgroundColor: '#00CAF5', paddingVertical: 10, alignItems: 'center' }}
+              >
+                <Text style={{ color: '#0F172A', fontWeight: '700', fontSize: 14 }}>Save Preset</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setSavingPreset(false)}
+                style={{ borderRadius: 8, borderWidth: 1, borderColor: '#334155', paddingVertical: 10, paddingHorizontal: 16, alignItems: 'center' }}
+              >
+                <Text style={{ color: '#94A3B8', fontSize: 14 }}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
 
         {/* Live player card */}
         {activeUrl ? (
@@ -150,9 +295,10 @@ export function HLSListeningScreen(_props: Props) {
         <Text style={{ color: '#94A3B8', fontSize: 11, fontWeight: '600', letterSpacing: 0.5, marginBottom: 10 }}>
           PRESET STATIONS
         </Text>
-        {PRESET_STREAMS.map((stream, index) => {
+        {allPresets.map((stream, index) => {
           const isActive = activeUrl === stream.url;
-          const isLast = index === PRESET_STREAMS.length - 1;
+          const isLast = index === allPresets.length - 1;
+          const isUserPreset = userPresets.some((p) => p.url === stream.url);
           return (
             <Pressable
               key={stream.url}
@@ -185,7 +331,20 @@ export function HLSListeningScreen(_props: Props) {
                   />
                   <View style={{ marginLeft: 12 }}>
                     <Text style={{ color: '#F8FAFC', fontWeight: '500', fontSize: 14 }}>{stream.label}</Text>
-                    <Text style={{ color: '#94A3B8', fontSize: 11, marginTop: 1 }} numberOfLines={1}>{stream.url}</Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
+                    <View style={{
+                      borderRadius: 4,
+                      borderWidth: 1,
+                      borderColor: 'type' in stream && stream.type === 'hls' ? 'rgba(139,92,246,0.5)' : 'rgba(0,202,245,0.35)',
+                      paddingHorizontal: 5,
+                      paddingVertical: 1,
+                    }}>
+                      <Text style={{ color: 'type' in stream && stream.type === 'hls' ? '#A78BFA' : '#38BDF8', fontSize: 9, fontWeight: '700', letterSpacing: 0.5 }}>
+                        {'type' in stream ? (stream.type === 'hls' ? 'HLS' : 'ICY') : 'ICY'}
+                      </Text>
+                    </View>
+                    <Text style={{ color: '#94A3B8', fontSize: 11 }} numberOfLines={1}>{stream.url}</Text>
+                  </View>
                   </View>
                 </View>
                 {isActive ? (
@@ -193,6 +352,14 @@ export function HLSListeningScreen(_props: Props) {
                     <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#EF4444' }} />
                     <Text style={{ color: '#EF4444', fontSize: 10, fontWeight: '700' }}>LIVE</Text>
                   </View>
+                ) : isUserPreset ? (
+                  <Pressable
+                    onPress={(e) => { e.stopPropagation?.(); removeUserPreset(stream.url); }}
+                    style={{ padding: 4 }}
+                    hitSlop={8}
+                  >
+                    <Ionicons name="close-circle" size={18} color="#475569" />
+                  </Pressable>
                 ) : (
                   <Ionicons name="chevron-forward" size={16} color="#64748B" />
                 )}

@@ -157,7 +157,7 @@ function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
               <Ionicons color="#00CAF5" name="radio-outline" size={18} />
               <View style={{ width: 8 }} />
               <Text style={{ color: '#F8FAFC', fontSize: 15, fontWeight: '600' }}>
-                HLS Listening
+                Streaming
               </Text>
             </View>
           </Pressable>
@@ -218,14 +218,14 @@ function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
 export default function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>(seedPlaylists);
 
-  const addPlaylist = (payload: { name: string; description: string; url?: string }) => {
+  const addPlaylist = (payload: { name: string; description: string; url?: string; songs?: Song[] }) => {
     setPlaylists((current) => [
       {
         id: Date.now().toString(),
         name: payload.name,
         description: payload.description,
         url: payload.url,
-        songs: [],
+        songs: payload.songs ?? [],
       },
       ...current,
     ]);
@@ -339,7 +339,7 @@ export default function App() {
       <Stack.Screen
         name="HLSListening"
         component={HLSListeningScreen}
-        options={{ title: 'HLS Listening' }}
+        options={{ title: 'Streaming' }}
       />
 
       <Stack.Screen
