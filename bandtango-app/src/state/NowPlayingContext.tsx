@@ -114,6 +114,21 @@ type NowPlayingContextValue = {
   /** Stable playing flag — written by LivePlayerCard DOM event listeners, read by MiniBar. */
   activeHlsPlaying: boolean;
   setActiveHlsPlaying: (playing: boolean) => void;
+  /** Elapsed seconds — written by LivePlayerCard ticker, shared across all screens. */
+  activeHlsElapsedSec: number;
+  setActiveHlsElapsedSec: (sec: number) => void;
+  /** Total duration in seconds (0 for live/unknown). */
+  activeHlsDurationSec: number;
+  setActiveHlsDurationSec: (sec: number) => void;
+  /** Player toggle states — shared so they persist across navigation. */
+  activeHlsFavorite: boolean;
+  toggleActiveHlsFavorite: () => void;
+  activeHlsRepeat: boolean;
+  toggleActiveHlsRepeat: () => void;
+  activeHlsShuffle: boolean;
+  toggleActiveHlsShuffle: () => void;
+  activeHlsQueue: boolean;
+  toggleActiveHlsQueue: () => void;
   setSession: (payload: SetSessionPayload) => void;
   togglePlay: () => void;
   nextTrack: () => void;
@@ -180,21 +195,48 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
   const setActiveHlsPlaying = useCallback((playing: boolean) => {
     setActiveHlsPlayingState(playing);
   }, []);
+
+  // ── Shared HLS playback position + toggle states ─────────────────────────
+  const [activeHlsElapsedSec,  setActiveHlsElapsedSecState]  = useState(0);
+  const [activeHlsDurationSec, setActiveHlsDurationSecState] = useState(0);
+  const [activeHlsFavorite,    setActiveHlsFavoriteState]    = useState(false);
+  const [activeHlsRepeat,      setActiveHlsRepeatState]      = useState(false);
+  const [activeHlsShuffle,     setActiveHlsShuffleState]     = useState(false);
+  const [activeHlsQueue,       setActiveHlsQueueState]       = useState(false);
+
+  const setActiveHlsElapsedSec  = useCallback((sec: number) => setActiveHlsElapsedSecState(sec), []);
+  const setActiveHlsDurationSec = useCallback((sec: number) => setActiveHlsDurationSecState(sec), []);
+  const toggleActiveHlsFavorite = useCallback(() => setActiveHlsFavoriteState((v) => !v), []);
+  const toggleActiveHlsRepeat   = useCallback(() => setActiveHlsRepeatState((v) => !v), []);
+  const toggleActiveHlsShuffle  = useCallback(() => setActiveHlsShuffleState((v) => !v), []);
+  const toggleActiveHlsQueue    = useCallback(() => setActiveHlsQueueState((v) => !v), []);
+
   const setActiveHlsMeta = useCallback((title: string, artist: string) => {
     setActiveHlsTitleState(title);
     setActiveHlsArtistState(artist);
   }, []);
+  // Track the previous URL synchronously so we can detect real changes without
+  // adding activeHlsUrl as a dep of the callback itself.
+  const activeHlsUrlRef = useRef('');
   const setActiveHlsUrl = useCallback((url: string) => {
+    const prev = activeHlsUrlRef.current;
+    activeHlsUrlRef.current = url;
     setActiveHlsUrlState(url);
+    // Only clear stale metadata when the URL actually changes, not on redundant calls
+    // (e.g. HLSListeningScreen card and handleStart both calling with the same URL).
+    if (url !== prev) {
+      setActiveHlsTitleState('');
+      setActiveHlsArtistState('');
+    }
     // When explicitly cleared, also tear down the persisted audio element and hide MiniBar.
     if (!url) {
       const a = hlsAudioRef.current;
       if (a) { a.pause(); a.src = ''; }
       hlsAudioRef.current = null;
       setHlsStream(null);
-      setActiveHlsTitleState('');
-      setActiveHlsArtistState('');
       setActiveHlsPlayingState(false);
+      setActiveHlsElapsedSecState(0);
+      setActiveHlsDurationSecState(0);
     }
   }, []);  // setState setters are stable — no deps needed
   // Persisted audio element — lives for the lifetime of the provider, not the card.
@@ -234,7 +276,14 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
   }, []);
   const toggleHlsPlay = useCallback(() => {
     hlsToggleRef.current?.();
-  }, []);
+    // Sync activeHlsPlaying from the audio element after the toggle fires,
+    // since play/pause event listeners may have been removed when the card
+    // unmounted (navigated away). A rAF ensures the audio state has updated.
+    requestAnimationFrame(() => {
+      const audio = hlsAudioRef.current;
+      if (audio) setActiveHlsPlayingState(!audio.paused);
+    });
+  }, [hlsAudioRef]);
 
   const repeatRef = useRef(state.repeatEnabled);
   const shuffleRef = useRef(state.shuffleEnabled);
@@ -516,6 +565,18 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
       setActiveHlsMeta,
       activeHlsPlaying,
       setActiveHlsPlaying,
+      activeHlsElapsedSec,
+      setActiveHlsElapsedSec,
+      activeHlsDurationSec,
+      setActiveHlsDurationSec,
+      activeHlsFavorite,
+      toggleActiveHlsFavorite,
+      activeHlsRepeat,
+      toggleActiveHlsRepeat,
+      activeHlsShuffle,
+      toggleActiveHlsShuffle,
+      activeHlsQueue,
+      toggleActiveHlsQueue,
       setSession,
       togglePlay,
       nextTrack: () => stepTrack(1),
@@ -531,7 +592,10 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
      activeHlsTitle, activeHlsArtist, setActiveHlsMeta, activeHlsPlaying, setActiveHlsPlaying, position,
      setIsVisible, setSession, seekToRatio, state, stepTrack,
      toggleFavorite, togglePlay, toggleQueue, toggleRepeat, toggleShuffle,
-     setHlsStreamCallback, registerHlsToggle, toggleHlsPlay]
+     setHlsStreamCallback, registerHlsToggle, toggleHlsPlay,
+     activeHlsElapsedSec, setActiveHlsElapsedSec, activeHlsDurationSec, setActiveHlsDurationSec,
+     activeHlsFavorite, toggleActiveHlsFavorite, activeHlsRepeat, toggleActiveHlsRepeat,
+     activeHlsShuffle, toggleActiveHlsShuffle, activeHlsQueue, toggleActiveHlsQueue]
   );
 
   return (

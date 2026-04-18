@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import {
   DrawerContentComponentProps,
   DrawerContentScrollView,
@@ -11,7 +12,7 @@ import {
 } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { StatusBar } from 'expo-status-bar';
-import { useMemo, useState } from 'react';
+import { useMemo, useEffect, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 import './global.css';
 import { NowPlayingMiniBar } from './src/components/NowPlayingMiniBar';
@@ -217,6 +218,45 @@ function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
 
 export default function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>(seedPlaylists);
+  const [apiPlaylists, setApiPlaylists] = useState<Playlist[]>([]);
+  const [apiLoading, setApiLoading] = useState(true);
+  const [apiError, setApiError] = useState('');
+
+  useEffect(() => {
+    fetch('http://localhost:7070/api/music-playlists', { cache: 'no-store' })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        const data = await res.json() as unknown;
+        const items: Array<Record<string, unknown>> = Array.isArray(data)
+          ? data as Array<Record<string, unknown>>
+          : ((data as Record<string, unknown>).data ?? (data as Record<string, unknown>).results ?? []) as Array<Record<string, unknown>>;
+        setApiPlaylists(
+          items.map((p, i) => {
+            // Server may return tracks as `tracks` or `songs` — normalise to Song[].
+            const rawTracks = Array.isArray(p.tracks) ? p.tracks
+              : Array.isArray(p.songs) ? p.songs
+              : [];
+            const songs: Song[] = (rawTracks as Array<Record<string, unknown>>).map((t, ti) => ({
+              id:       String(t.id       ?? `${i}-track-${ti}`),
+              title:    String(t.title    ?? t.name   ?? 'Unknown'),
+              artist:   String(t.artist   ?? t.band   ?? ''),
+              duration: String(t.duration ?? t.length ?? '--:--'),
+              audioUrl: t.audioUrl ? String(t.audioUrl) : t.url ? String(t.url) : undefined,
+              meta:     t,
+            }));
+            return {
+              id:          String(p.id ?? `api-${i}`),
+              name:        String(p.name ?? p.title ?? 'Untitled'),
+              description: [p.genre, p.mood].filter(Boolean).join(' · ') || String(p.description ?? ''),
+              url:         p.url ? String(p.url) : undefined,
+              songs,
+            };
+          })
+        );
+      })
+      .catch((e: unknown) => setApiError(e instanceof Error ? e.message : 'Failed to load playlists'))
+      .finally(() => setApiLoading(false));
+  }, []);
 
   const addPlaylist = (payload: { name: string; description: string; url?: string; songs?: Song[] }) => {
     setPlaylists((current) => [
@@ -233,48 +273,44 @@ export default function App() {
 
   const addSong = (
     playlistId: string,
-    payload: { title: string; artist: string; duration: string; audioUrl?: string }
+    payload: { title: string; artist: string; duration: string; audioUrl?: string; meta?: Record<string, unknown> }
   ) => {
-    setPlaylists((current) =>
-      current.map((playlist) => {
-        if (playlist.id !== playlistId) {
-          return playlist;
-        }
-
-        const song: Song = {
-          id: `${playlistId}-${Date.now()}`,
-          title: payload.title,
-          artist: payload.artist,
-          duration: payload.duration,
-          audioUrl: payload.audioUrl,
-        };
-
-        return {
-          ...playlist,
-          songs: [song, ...playlist.songs],
-        };
-      })
-    );
+    const song: Song = {
+      // Spread all original API fields first so nothing is lost, then
+      // overlay the normalised fields so they always win.
+      ...(payload.meta ?? {}),
+      id:       `${playlistId}-${Date.now()}`,
+      title:    payload.title,
+      artist:   payload.artist,
+      duration: payload.duration,
+      audioUrl: payload.audioUrl,
+      meta:     payload.meta,
+    };
+    const updater = (current: Playlist[]) =>
+      current.map((p) =>
+        p.id !== playlistId ? p : { ...p, songs: [song, ...p.songs] }
+      );
+    setPlaylists(updater);
+    setApiPlaylists(updater);
   };
 
   const removeSong = (playlistId: string, songId: string) => {
-    setPlaylists((current) =>
-      current.map((playlist) => {
-        if (playlist.id !== playlistId) {
-          return playlist;
-        }
+    const updater = (current: Playlist[]) =>
+      current.map((p) =>
+        p.id !== playlistId ? p : { ...p, songs: p.songs.filter((s) => s.id !== songId) }
+      );
+    setPlaylists(updater);
+    setApiPlaylists(updater);
+  };
 
-        return {
-          ...playlist,
-          songs: playlist.songs.filter((song) => song.id !== songId),
-        };
-      })
-    );
+  const deletePlaylist = (playlistId: string) => {
+    setPlaylists((current) => current.filter((p) => p.id !== playlistId));
+    setApiPlaylists((current) => current.filter((p) => p.id !== playlistId));
   };
 
   const playlistMap = useMemo(
-    () => new Map(playlists.map((playlist) => [playlist.id, playlist])),
-    [playlists]
+    () => new Map([...playlists, ...apiPlaylists].map((p) => [p.id, p])),
+    [playlists, apiPlaylists]
   );
 
   const MainStackNavigator = () => (
@@ -311,11 +347,19 @@ export default function App() {
           ),
         })}
       >
-        {(props) => <HomeScreen {...props} playlists={playlists} />}
+        {(props) => <HomeScreen {...props} playlists={[...playlists, ...apiPlaylists]} apiPlaylistIds={new Set(apiPlaylists.map((p) => p.id))} />}
       </Stack.Screen>
 
       <Stack.Screen name="Playlists" options={{ title: 'Playlists' }}>
-        {(props) => <PlaylistsScreen {...props} playlists={playlists} />}
+        {(props) => (
+          <PlaylistsScreen
+            {...props}
+            playlists={playlists}
+            apiPlaylists={apiPlaylists}
+            apiLoading={apiLoading}
+            apiError={apiError}
+          />
+        )}
       </Stack.Screen>
 
       <Stack.Screen
@@ -377,8 +421,41 @@ export default function App() {
           <PlaylistDetailScreen
             {...props}
             playlist={playlistMap.get(props.route.params.playlistId)}
+            isNew={!apiPlaylists.some((p) => p.id === props.route.params.playlistId)}
             onAddSong={addSong}
             onRemoveSong={removeSong}
+            onDeletePlaylist={(id) => {
+              deletePlaylist(id);
+              props.navigation.goBack();
+            }}
+            onPlaylistSaved={(saved) => {
+              setApiPlaylists((current) => {
+                // Server may echo back as `tracks` or `songs` — prefer `tracks`, fall back to `songs`,
+                // and if neither is a non-empty array keep the locally-held songs.
+                const existing = current.find((p) => p.id === saved.id);
+                const serverTracks = (saved as unknown as Record<string, unknown>).tracks;
+                const songs =
+                  (Array.isArray(serverTracks) && serverTracks.length > 0 ? serverTracks as typeof saved.songs : null) ??
+                  (Array.isArray(saved.songs) && saved.songs.length > 0 ? saved.songs : null) ??
+                  existing?.songs ?? [];
+                const normalized: Playlist = { ...saved, songs };
+                const exists = !!existing;
+                return exists
+                  ? current.map((p) => (p.id === normalized.id ? normalized : p))
+                  : [normalized, ...current];
+              });
+              // Also sync into local playlists if it was a local-only entry.
+              setPlaylists((current) => {
+                const existing = current.find((p) => p.id === saved.id);
+                if (!existing) return current;
+                const serverTracks = (saved as unknown as Record<string, unknown>).tracks;
+                const songs =
+                  (Array.isArray(serverTracks) && serverTracks.length > 0 ? serverTracks as typeof saved.songs : null) ??
+                  (Array.isArray(saved.songs) && saved.songs.length > 0 ? saved.songs : null) ??
+                  existing.songs;
+                return current.map((p) => p.id === saved.id ? { ...saved, songs } : p);
+              });
+            }}
           />
         )}
       </Stack.Screen>
@@ -386,6 +463,7 @@ export default function App() {
   );
 
   return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
     <NowPlayingProvider>
       <View style={{ flex: 1, backgroundColor: '#0B1220' }}>
         <View style={{ flex: 1, backgroundColor: '#0B1220' }}>
@@ -405,5 +483,6 @@ export default function App() {
         </View>
       </View>
     </NowPlayingProvider>
+    </GestureHandlerRootView>
   );
 }

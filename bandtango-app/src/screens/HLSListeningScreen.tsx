@@ -177,8 +177,8 @@ export function HLSListeningScreen(_props: Props) {
                 gap: 6,
               })}
             >
-              <Ionicons name="bookmark-outline" size={18} color="#00CAF5" />
-              <Text style={{ color: '#00CAF5', fontSize: 13, fontWeight: '600' }}>Save</Text>
+              <Ionicons name="add-circle-outline" size={18} color="#00CAF5" />
+              <Text style={{ color: '#00CAF5', fontSize: 13, fontWeight: '600' }}>Preset</Text>
             </Pressable>
           )}
         </View>

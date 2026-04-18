@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { Modal, Pressable, Text, View } from 'react-native';
 import { useNowPlaying } from '../state/NowPlayingContext';
 
@@ -9,10 +9,10 @@ export function NowPlayingMiniBar() {
     currentTrack,
     state,
     activeHlsUrl,
-    hlsAudioRef,
     activeHlsTitle,
     activeHlsArtist,
     activeHlsPlaying,
+    activeHlsElapsedSec,
     toggleHlsPlay,
     positionMs: ctxPositionMs,
     durationMs: ctxDurationMs,
@@ -27,18 +27,6 @@ export function NowPlayingMiniBar() {
   } = useNowPlaying();
   const [expanded, setExpanded] = useState(false);
   const [barWidth, setBarWidth] = useState(0);
-
-  // ── Elapsed ticker — reads directly from the persisted audio element so it
-  //    keeps ticking even when LivePlayerCard is unmounted (navigated away).
-  const [elapsedSec, setElapsedSec] = useState(0);
-  useEffect(() => {
-    if (!activeHlsUrl) { setElapsedSec(0); return; }
-    const tick = setInterval(() => {
-      const a = hlsAudioRef.current;
-      if (a) setElapsedSec(Math.floor(a.currentTime));
-    }, 1000);
-    return () => clearInterval(tick);
-  }, [activeHlsUrl, hlsAudioRef]);
 
   // ── HLS live stream mini bar ───────────────────────────────────────────────
   if (activeHlsUrl) {
@@ -63,7 +51,7 @@ export function NowPlayingMiniBar() {
           {/* Elapsed + play/pause */}
           <View className="flex-row items-center gap-2">
             <Text style={{ color: '#00CAF5', fontSize: 13, fontWeight: '700', fontVariant: ['tabular-nums'] }}>
-              {String(Math.floor(elapsedSec / 60)).padStart(2, '0')}:{String(elapsedSec % 60).padStart(2, '0')}
+              {String(Math.floor(activeHlsElapsedSec / 60)).padStart(2, '0')}:{String(activeHlsElapsedSec % 60).padStart(2, '0')}
             </Text>
             <Pressable
               className="h-10 w-10 items-center justify-center rounded-full bg-[#00CAF5]"

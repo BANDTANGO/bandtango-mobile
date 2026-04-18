@@ -162,6 +162,8 @@ async function probeUrl(rawUrl: string): Promise<ProbeResult> {
 const GENRE_TAGS = ['Rock', 'Hip-Hop', 'Jazz', 'Electronic', 'R&B', 'Pop', 'Country', 'Classical', 'Indie', 'Metal'];
 const MOOD_TAGS  = ['Chill', 'Hype', 'Focus', 'Workout', 'Sad', 'Happy', 'Late Night', 'Morning'];
 
+const MUSIC_PLAYLIST_ENDPOINT = 'http://localhost:7070/api/music-playlists';
+
 export function AddPlaylistScreen({ navigation, onCreatePlaylist }: AddPlaylistScreenProps) {
   const [name, setName]               = useState('');
   const [description, setDescription] = useState('');
@@ -173,6 +175,8 @@ export function AddPlaylistScreen({ navigation, onCreatePlaylist }: AddPlaylistS
   const [descFocused, setDescFocused] = useState(false);
   const [urlFocused, setUrlFocused]   = useState(false);
   const [error, setError]             = useState('');
+  const [submitting, setSubmitting]   = useState(false);
+  const [submitError, setSubmitError] = useState('');
   const [probe, setProbe]             = useState<ProbeResult>({ status: 'idle' });
 
   const handleUrlBlur = async () => {
@@ -187,17 +191,53 @@ export function AddPlaylistScreen({ navigation, onCreatePlaylist }: AddPlaylistS
     setList(list.includes(tag) ? list.filter((t) => t !== tag) : [...list, tag]);
   };
 
-  const submit = () => {
+  const submit = async () => {
     if (!name.trim()) {
       setError('Playlist name is required.');
       return;
     }
-    onCreatePlaylist({
+
+    setSubmitting(true);
+    setSubmitError('');
+
+    const body = {
       name: name.trim(),
       description: description.trim() || 'No description yet',
+      genre: selectedGenres.join(', '),
+      mood: selectedMoods.join(', '),
+      visibility: isPublic ? 'public' : 'private',
+      url: url.trim() || '',
+      songs: {},
+    };
+
+    try {
+      const res = await fetch(MUSIC_PLAYLIST_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        setSubmitError(`Server error ${res.status}${text ? `: ${text}` : ''}`);
+        setSubmitting(false);
+        return;
+      }
+    } catch {
+      setSubmitError('Could not reach the server. Check your connection and try again.');
+      setSubmitting(false);
+      return;
+    }
+
+    // Mirror the new playlist locally so the UI reflects it immediately.
+    onCreatePlaylist({
+      name: body.name,
+      description: body.description,
       url: url.trim() || undefined,
       songs: probe.status === 'ok' ? probe.songs : [],
     });
+
+    setSubmitting(false);
     navigation.goBack();
   };
 
@@ -396,18 +436,29 @@ export function AddPlaylistScreen({ navigation, onCreatePlaylist }: AddPlaylistS
           })}
         </View>
 
+        {/* Submit error */}
+        {!!submitError && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 16, backgroundColor: 'rgba(153,27,27,0.15)', borderRadius: 10, borderWidth: 1, borderColor: '#7f1d1d', padding: 12 }}>
+            <Ionicons name="alert-circle-outline" size={16} color="#FCA5A5" />
+            <Text style={{ color: '#FCA5A5', fontSize: 13, flex: 1 }}>{submitError}</Text>
+          </View>
+        )}
+
         {/* Submit */}
         <Pressable
-          onPress={submit}
-          style={{ marginTop: 28, borderRadius: 10, overflow: 'hidden' }}
+          onPress={submitting ? undefined : submit}
+          style={{ marginTop: 28, borderRadius: 10, overflow: 'hidden', opacity: submitting ? 0.6 : 1 }}
         >
           <LinearGradient
             colors={['#1d4ed8', '#2563eb', '#3b82f6']}
             start={{ x: 0, y: 0 }}
             end={{ x: 1, y: 0 }}
-            style={{ paddingVertical: 14, alignItems: 'center' }}
+            style={{ paddingVertical: 14, alignItems: 'center', flexDirection: 'row', justifyContent: 'center', gap: 8 }}
           >
-            <Text style={{ color: '#F8FAFC', fontSize: 15, fontWeight: '700', letterSpacing: 0.3 }}>Create Playlist</Text>
+            {submitting && <ActivityIndicator size="small" color="#F8FAFC" />}
+            <Text style={{ color: '#F8FAFC', fontSize: 15, fontWeight: '700', letterSpacing: 0.3 }}>
+              {submitting ? 'Creating…' : 'Create Playlist'}
+            </Text>
           </LinearGradient>
         </Pressable>
 

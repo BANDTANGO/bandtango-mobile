@@ -1,11 +1,14 @@
 import { useMemo, useEffect, useRef, useState } from 'react';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { Animated, Image, ImageBackground, Pressable, ScrollView, Text, View } from 'react-native';
+import { Animated, ActivityIndicator, Image, ImageBackground, Pressable, ScrollView, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { LivePlayerCard } from '../components/LivePlayerCard';
 import { PRESET_STREAMS } from '../data/streamPresets';
 import { Playlist, MainStackParamList } from '../types';
 import { useNowPlaying } from '../state/NowPlayingContext';
+import { getAnalyserData } from '../utils/audioAnalyser';
+
+const LISTEN_BASE = 'http://localhost:7070';
 
 const BAR_COUNT = 9;
 const BAR_HEIGHTS = [240, 200, 155, 105, 60, 105, 155, 200, 240];
@@ -32,33 +35,122 @@ async function fetchAlbumArt(artist: string, title: string): Promise<string | nu
 function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | null; playing?: boolean }) {
   const anims = useRef(BAR_HEIGHTS.map(() => new Animated.Value(1))).current;
   const pulsesRef = useRef<Animated.CompositeAnimation[]>([]);
+  const rafRef    = useRef<number | null>(null);
+  // Smoothed values — exponential moving average per bar
+  const smoothed  = useRef(new Float32Array(BAR_HEIGHTS.length).fill(0.10));
+  const zeroFrames = useRef(0);
+  const usingRealData = useRef(false);
 
   useEffect(() => {
     pulsesRef.current.forEach((p) => p.stop());
     pulsesRef.current = [];
+    if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    smoothed.current.fill(0.25);
+    zeroFrames.current = 0;
+    usingRealData.current = false;
 
     if (playing === false) {
       // Smoothly settle all bars to their minimum height
       Animated.parallel(
         anims.map((anim) =>
-          Animated.timing(anim, { toValue: 0.25, duration: 300, useNativeDriver: false })
+          Animated.timing(anim, { toValue: 1, duration: 5, useNativeDriver: false })
         )
       ).start();
-    } else {
-      // Each bar loops independently with a different speed — no delays, all start immediately
+      return;
+    }
+
+    // Log-spaced bin centers across the musically active range (mirrored).
+    // At fftSize=2048, sampleRate=44100: 1 bin ≈ 21.5 Hz.
+    //   bin 4  ≈   86 Hz (sub-bass)
+    //   bin 9  ≈  193 Hz (bass)
+    //   bin 20 ≈  430 Hz (low-mid)
+    //   bin 40 ≈  860 Hz (mid)
+    //   bin 62 ≈ 1333 Hz (upper-mid — more musical energy than 2.5 kHz)
+    const BAR_BIN_CENTERS = [4,  9, 15, 20,  25, 20, 15,  9, 4];
+    // Tighter spread for higher bars = better isolation and less dilution.
+    const BAR_BIN_SPREADS = [3,  3,  3,  4,   5,  4,  3,  3, 3];
+    // High-freq bins still carry less energy — boost them proportionally.
+    const BAR_GAIN        = [1.0, 1.2, 1.6, 2.2, 3.0, 2.2, 1.6, 1.2, 1.0];
+    const ZERO_FRAME_THRESHOLD = 60; // ~1 s at 60 fps before falling back
+    // Fast attack so beats feel snappy; slow decay so bars glide back down.
+    const ALPHA_ATTACK = 0.55;
+    const ALPHA_DECAY  = 0.45;
+    // Square-root scaling: expands mid-level signals without saturating peaks.
+    const GAMMA = 0.50;
+    // Minimum bar height — low enough that quiet gaps are clearly visible.
+    const BAR_FLOOR = 0.05;
+
+    const startSimulated = () => {
+      if (pulsesRef.current.length) return; // already running
       pulsesRef.current = anims.map((anim, i) => {
         const duration = 400 + i * 80;
         return Animated.loop(
           Animated.sequence([
-            Animated.timing(anim, { toValue: 0.25, duration, useNativeDriver: false }),
+            Animated.timing(anim, { toValue: BAR_FLOOR, duration, useNativeDriver: false }),
             Animated.timing(anim, { toValue: 1,    duration, useNativeDriver: false }),
           ])
         );
       });
       pulsesRef.current.forEach((p) => p.start());
-    }
+    };
 
-    return () => { pulsesRef.current.forEach((p) => p.stop()); };
+    const tick = () => {
+      rafRef.current = requestAnimationFrame(tick);
+      const result = getAnalyserData();
+
+      if (!result) {
+        startSimulated();
+        return;
+      }
+
+      const { data, binCount } = result;
+      const allZero = data.every((v) => v === 0);
+
+      if (allZero) {
+        zeroFrames.current += 1;
+        if (zeroFrames.current > ZERO_FRAME_THRESHOLD) {
+          startSimulated();
+        }
+        return;
+      }
+
+      // Real data is flowing — stop simulated animation if it was running
+      if (pulsesRef.current.length) {
+        pulsesRef.current.forEach((p) => p.stop());
+        pulsesRef.current = [];
+      }
+      zeroFrames.current = 0;
+      usingRealData.current = true;
+
+      anims.forEach((anim, i) => {
+        // Average bins within this bar's spread for its frequency band
+        const center = BAR_BIN_CENTERS[i];
+        const spread = BAR_BIN_SPREADS[i];
+        let sum = 0, count = 0;
+        for (let b = center - spread; b <= center + spread; b++) {
+          if (b >= 0 && b < binCount) { sum += data[b]; count++; }
+        }
+        // Apply per-bar gain before normalising so high-freq bars reach full height
+        const raw    = count > 0 ? Math.min(1, (sum / count / 255) * BAR_GAIN[i]) : 0;
+        // Gamma expand: stretches quiet signals across more of the bar height
+        const curved = Math.pow(raw, GAMMA);
+        const target = Math.max(BAR_FLOOR, curved);
+        const prev   = smoothed.current[i];
+        // Exponential moving average: different coefficients for rising vs falling
+        const alpha  = target > prev ? ALPHA_ATTACK : ALPHA_DECAY;
+        const next   = prev + (target - prev) * alpha;
+        smoothed.current[i] = next;
+        anim.setValue(next);
+      });
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      pulsesRef.current.forEach((p) => p.stop());
+      pulsesRef.current = [];
+      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    };
   }, [playing, anims]);
 
   return (
@@ -84,7 +176,7 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
             style={{
               flex: 1,
               borderRadius: 4,
-              height: anim.interpolate({ inputRange: [0.25, 1], outputRange: [BAR_HEIGHTS[i] * 0.25, BAR_HEIGHTS[i]] }),
+              height: anim.interpolate({ inputRange: [0.05, 1], outputRange: [BAR_HEIGHTS[i] * 0.05, BAR_HEIGHTS[i]] }),
               backgroundColor: `rgba(0, 202, 245, ${(0.4 + Math.abs(i - Math.floor(BAR_COUNT / 2)) * 0.08) * 0.35})`,
             }}
           />
@@ -102,11 +194,13 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
 
 type HomeScreenProps = NativeStackScreenProps<MainStackParamList, 'Home'> & {
   playlists: Playlist[];
+  apiPlaylistIds?: Set<string>;
 };
 
-export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
-  const { activeHlsTitle, activeHlsArtist, activeHlsPlaying, activeHlsUrl } = useNowPlaying();
+export function HomeScreen({ navigation, playlists, apiPlaylistIds, route }: HomeScreenProps) {
+  const { activeHlsTitle, activeHlsArtist, activeHlsPlaying, activeHlsUrl, activeHlsElapsedSec, setActiveHlsUrl } = useNowPlaying();
   const [albumArtUrl, setAlbumArtUrl] = useState<string | null>(null);
+  const [listenHlsUrl, setListenHlsUrl] = useState<string | null>(null);
   navigation.setOptions({
     headerRight: () => (
       <View className="flex-row gap-3 mr-4">
@@ -124,6 +218,36 @@ export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
     () => playlists.find((playlist) => playlist.id === route.params?.playlistId),
     [playlists, route.params?.playlistId]
   );
+
+  // When the selected playlist is a server playlist, call the listen endpoint
+  // to obtain the HLS stream URL. Reset when the playlist changes.
+  const isServerPlaylist = !!(selectedPlaylist && apiPlaylistIds?.has(selectedPlaylist.id));
+  useEffect(() => {
+    if (!isServerPlaylist || !selectedPlaylist) {
+      setListenHlsUrl(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`${LISTEN_BASE}/api/music-playlists/listen/${selectedPlaylist.id}`, { cache: 'no-store' })
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json() as { hls_url?: string };
+        console.log('Listen endpoint response:', data);
+        if (cancelled || !data.hls_url) return;
+        // hls_url may be relative (e.g. /hls/…/playlist.m3u8) — prepend origin.
+        const full = data.hls_url.startsWith('http')
+          ? data.hls_url
+          : `${LISTEN_BASE}${data.hls_url}`;
+
+        console.log('Resolved HLS URL:', full);
+        setListenHlsUrl(full);
+        setActiveHlsUrl(full);
+      })
+      .catch((e: unknown) => {
+        console.error('[HomeScreen] Failed to fetch listen URL:', e);
+      });
+    return () => { cancelled = true; };
+  }, [isServerPlaylist, selectedPlaylist?.id]);
 
   const tracks = useMemo(() => {
     const sourcePlaylists = selectedPlaylist ? [selectedPlaylist] : playlists;
@@ -155,18 +279,50 @@ export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
   const featuredTrack = tracks[0];
 
   // ── Resolve which URL the LivePlayerCard should use ──────────────────────────
-  // If a preset station or custom HLS stream was started on HLSListeningScreen
-  // and is still active (activeHlsUrl differs from the local playlist URL),
-  // show THAT stream in the card so metadata stays in sync. However, if the
-  // user explicitly navigated to a playlist that has its own stream URL, that
-  // intent always wins — don't let a previously-active external stream override it.
+  // For server playlists: use the resolved listen URL, or fall back to whatever
+  // activeHlsUrl context already holds (set early by PlaylistsScreen's tap handler).
+  // For local playlists / no selection: use the local track audioUrl or active preset.
   const localUrl = featuredTrack?.audioUrl ?? '';
-  const isExternalStreamActive = !selectedPlaylist?.url && !!activeHlsUrl && activeHlsUrl !== localUrl;
-  const cardUrl = isExternalStreamActive ? activeHlsUrl : localUrl;
+  // Three distinct cases:
+  // 1. Server playlist: activeHlsUrl is ground truth (updated by listen fetch).
+  //    Fall back to listenHlsUrl while the context hasn't been updated yet.
+  // 2. Local playlist: prefer the static track audioUrl; fall back to activeHlsUrl.
+  // 3. No playlist selected (preset): use activeHlsUrl.
+  const cardUrl = isServerPlaylist
+    ? (activeHlsUrl || listenHlsUrl || '')
+    : (localUrl || activeHlsUrl || '');
+  const isLoadingStream = isServerPlaylist && !cardUrl;
   const activePreset = PRESET_STREAMS.find((s) => s.url === cardUrl);
-  const cardLabel        = activePreset?.label ?? featuredTrack?.title;
-  const cardInitialTitle = activePreset?.label ?? featuredTrack?.title;
+  const cardLabel         = activePreset?.label ?? selectedPlaylist?.name ?? featuredTrack?.title;
+  const cardInitialTitle  = activePreset?.label ?? featuredTrack?.title;
   const cardInitialArtist = activePreset ? '' : featuredTrack?.artist;
+
+  // ── Skip-forward handler ────────────────────────────────────────────────
+  // Only available for server playlists with more than one song.
+  const serverSongCount = isServerPlaylist ? (selectedPlaylist?.songs?.length ?? 0) : 0;
+  const handleNext = serverSongCount > 1 && selectedPlaylist ? async () => {
+    try {
+      const from = activeHlsElapsedSec;
+      const res = await fetch(
+        `${LISTEN_BASE}/api/music-playlists/listen/${selectedPlaylist.id}?from=${from}&next`,
+        { cache: 'no-store' }
+      );
+      if (!res.ok) return;
+      const data = await res.json() as { hls_url?: string };
+      if (!data.hls_url) return;
+      const full = data.hls_url.startsWith('http')
+        ? data.hls_url
+        : `${LISTEN_BASE}${data.hls_url}`;
+      setListenHlsUrl(full);
+      setActiveHlsUrl(full);
+    } catch { /* silently ignore */ }
+  } : undefined;
+
+  // Update the nav header title when a preset is active.
+  useEffect(() => {
+    const title = activePreset?.label ?? selectedPlaylist?.name ?? 'BANDTANGO';
+    navigation.setOptions({ title });
+  }, [activePreset?.label, selectedPlaylist?.name, navigation]);
 
   // ── Album art lookup ────────────────────────────────────────────────────
   // Prefer live stream metadata (title/artist from the HLS stream parser) over
@@ -213,7 +369,15 @@ export function HomeScreen({ navigation, playlists, route }: HomeScreenProps) {
           label={cardLabel}
           initialTitle={cardInitialTitle}
           initialArtist={cardInitialArtist}
+          autoplay={isServerPlaylist}
+          onNext={handleNext}
         />
+        {isLoadingStream && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, paddingVertical: 24 }}>
+            <ActivityIndicator size="small" color="#00CAF5" />
+            <Text style={{ color: '#64748B', fontSize: 14 }}>Connecting to stream…</Text>
+          </View>
+        )}
       </ScrollView>
     </View>
   );

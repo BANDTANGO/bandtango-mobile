@@ -2,6 +2,7 @@ import { Ionicons, MaterialCommunityIcons, MaterialIcons } from '@expo/vector-ic
 import { useEffect, useRef, useState } from 'react';
 import { LayoutChangeEvent, Pressable, Text, View } from 'react-native';
 import { useNowPlaying } from '../state/NowPlayingContext';
+import { wireAudioElement, resumeCtx } from '../utils/audioAnalyser';
 
 // ── Metadata helpers ────────────────────────────────────────────────────────
 
@@ -35,11 +36,39 @@ async function fetchSomaFmMeta(channelId: string): Promise<TrackMeta | null> {
 }
 
 async function fetchHlsMeta(playlistUrl: string): Promise<TrackMeta | null> {
+  // Use an AbortController so we never hang on a live endpoint that keeps the
+  // connection open indefinitely. 8 s is generous for a local server.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
   // Parse the M3U8 playlist
   try {
-    const res = await fetch(playlistUrl, { cache: 'no-store' });
-    if (!res.ok) return null;
-    const text  = await res.text();
+    const res = await fetch(playlistUrl, { cache: 'no-store', signal: controller.signal });
+    if (!res.ok) { clearTimeout(timeout); return null; }
+
+    // Read the body in chunks and stop as soon as we have a complete M3U8 header
+    // (ends with a segment URI). This avoids waiting for EOF on live streams.
+    let text = '';
+    const reader = res.body?.getReader();
+    const decoder = new TextDecoder();
+    if (reader) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (value) text += decoder.decode(value, { stream: !done });
+          // Stop once we've seen at least one EXTINF + a URI line after it, or EXT-X-ENDLIST
+          if (done || text.includes('#EXT-X-ENDLIST') ||
+              /^#EXTINF.+\r?\n.+/m.test(text)) {
+            reader.cancel().catch(() => {});
+            break;
+          }
+        }
+      } catch { /* reader aborted */ }
+    } else {
+      text = await res.text();
+    }
+    clearTimeout(timeout);
+
     const lines = text.split('\n').map((l) => l.trim());
 
     // ── Comment-block track list: # Track N: Artist - Title [Album] ──────
@@ -107,7 +136,7 @@ async function fetchHlsMeta(playlistUrl: string): Promise<TrackMeta | null> {
         ? { artist: lastExtinf.slice(0, di).trim(), title: lastExtinf.slice(di + 3).trim() }
         : { artist: '', title: lastExtinf };
     }
-  } catch { /* ignore */ }
+  } catch { clearTimeout(timeout); /* ignore */ }
 
   return null;
 }
@@ -136,10 +165,26 @@ export interface LivePlayerCardProps {
   initialTitle?: string;
   /** Pre-known artist shown before metadata is fetched */
   initialArtist?: string;
+  /** When true, immediately call play() even if the audio element is already
+   * loaded (e.g. paused from a previous session). Useful when navigation
+   * should auto-start the stream without a manual button tap. */
+  autoplay?: boolean;
+  /** When provided, activates the skip-forward button and calls this on press. */
+  onNext?: () => void;
 }
 
-export function LivePlayerCard({ url, label, initialTitle, initialArtist }: LivePlayerCardProps) {
-  const { setHlsStream, registerHlsToggle, hlsAudioRef, activeHlsUrl, setActiveHlsUrl, setActiveHlsMeta, setActiveHlsPlaying } = useNowPlaying();
+export function LivePlayerCard({ url, label, initialTitle, initialArtist, autoplay, onNext }: LivePlayerCardProps) {
+  const {
+    setHlsStream, registerHlsToggle, hlsAudioRef, activeHlsUrl, setActiveHlsUrl,
+    activeHlsTitle, activeHlsArtist,
+    setActiveHlsMeta, activeHlsPlaying, setActiveHlsPlaying,
+    activeHlsElapsedSec, setActiveHlsElapsedSec,
+    activeHlsDurationSec, setActiveHlsDurationSec,
+    activeHlsFavorite, toggleActiveHlsFavorite,
+    activeHlsRepeat,   toggleActiveHlsRepeat,
+    activeHlsShuffle,  toggleActiveHlsShuffle,
+    activeHlsQueue,    toggleActiveHlsQueue,
+  } = useNowPlaying();
 
   // Lazy-init from the persisted element so we don't briefly show "paused"
   // on re-mount and trigger the play/pause sync effect to stop audio.
@@ -147,20 +192,28 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     const a = hlsAudioRef.current;
     return !!a && !a.paused && !a.ended;
   });
-  const [error,      setError]      = useState<string | null>(null);
-  const [trackMeta,  setTrackMeta]  = useState<TrackMeta | null>(null);
+  const [error,        setError]        = useState<string | null>(null);
+  const [trackMeta,    setTrackMeta]    = useState<TrackMeta | null>(null);
   const [trackMetaUrl, setTrackMetaUrl] = useState<string>('');
-  const [elapsedSec, setElapsedSec] = useState(0);
-  const [durationSec,setDurationSec]= useState(0);
-  const [barWidth,   setBarWidth]   = useState(0);
-  const [isFavorite, setIsFavorite] = useState(false);
-  const [isRepeat,   setIsRepeat]   = useState(false);
-  const [isShuffle,  setIsShuffle]  = useState(false);
-  const [isQueue,    setIsQueue]    = useState(false);
+  const [barWidth,     setBarWidth]     = useState(0);
 
   const audioRef    = hlsAudioRef;
   const metaTimer   = useRef<ReturnType<typeof setInterval> | null>(null);
   const tickerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  // retryRef: monotonic generation counter — incremented on url change so stale
+  // retry timeouts from a previous url never fire against the new audio element.
+  const retryRef    = useRef(0);
+  const retryTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryCount  = useRef(0);
+  // Ref that always holds the latest activeHlsUrl without being a dep of the
+  // audio lifecycle effect — lets us gate context writes without re-running audio setup.
+  const activeHlsUrlRef = useRef(activeHlsUrl);
+  useEffect(() => { activeHlsUrlRef.current = activeHlsUrl; }, [activeHlsUrl]);
+
+  // autoplay in a ref so the audio lifecycle effect doesn't re-run (and tear
+  // down a working stream) just because the prop flipped from false→true.
+  const autoplayRef = useRef(autoplay);
+  useEffect(() => { autoplayRef.current = autoplay; }, [autoplay]);
 
   // ── Directly control audio and state together ───────────────────────
   // Do NOT use a separate "sync" effect that watches `playing` — that creates
@@ -174,6 +227,7 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
       a.play().catch(() => { setPlaying(false); setActiveHlsPlaying(false); });
       setPlaying(true);
       setActiveHlsPlaying(true);
+      resumeCtx();
     } else {
       a.pause();
       setPlaying(false);
@@ -184,23 +238,40 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
   // ── Audio lifecycle ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!url) return;
-    // Mark this URL as the active stream so the MiniBar becomes visible.
-    setActiveHlsUrl(url);
 
     const existing = audioRef.current;
     // Check whether the persisted element already has this URL loaded.
     // The browser resolves relative URLs to absolute, so compare both directions.
-    const isSameUrl = existing && !existing.error &&
+    // Guard existing.src !== '' to avoid false-positive when a pre-warmed element
+    // has no src yet (empty-string passes all endsWith checks).
+    const isSameUrl = existing && !existing.error && existing.src !== '' &&
       (existing.src === url || existing.src.endsWith(url) || url.endsWith(existing.src));
 
     if (isSameUrl && existing) {
       // ── Adopt the live element — re-attach listeners only ──
-      // Do NOT call setPlaying here — lazy init already captured the correct
-      // state on mount, and the onPlay/onPause listeners will handle future changes.
+      // DO NOT call setActiveHlsUrl here. Context already holds the correct URL
+      // (set by whoever initiated this stream: handleStart or HomeScreen's listen
+      // effect). A background card (e.g. HomeScreen behind HLSListeningScreen)
+      // runs this branch when its url prop still points to the old playlist; calling
+      // setActiveHlsUrl from here would overwrite the active preset URL in context.
       setError(null);
-      setElapsedSec(Math.floor(existing.currentTime));
+      setActiveHlsElapsedSec(Math.floor(existing.currentTime));
       const d = existing.duration;
-      if (d && isFinite(d)) setDurationSec(Math.floor(d));
+      if (d && isFinite(d)) setActiveHlsDurationSec(Math.floor(d));
+
+      // Immediately sync playing state from the element — handles the case where
+      // play() was called (e.g. from PlaylistsScreen's gesture handler) before
+      // our event listeners were attached, so the 'play' event was already fired.
+      const alreadyPlaying = !existing.paused;
+      setPlaying(alreadyPlaying);
+      setActiveHlsPlaying(alreadyPlaying);
+
+      // If autoplay is requested and the element is currently paused, kick it off.
+      if (autoplayRef.current && existing.paused) {
+        existing.play()
+          .then(() => { setPlaying(true); setActiveHlsPlaying(true); })
+          .catch(() => { setPlaying(false); setActiveHlsPlaying(false); });
+      }
 
       const onError = () => { setError('Could not load stream. Check the URL and try again.'); setPlaying(false); setActiveHlsPlaying(false); };
       const onEnded = () => { setPlaying(false); setActiveHlsPlaying(false); };
@@ -220,7 +291,9 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     }
 
     // ── Different URL — tear down old element, create new ─────────────────
-    // (setActiveHlsUrl(url) already called above — covers this branch too)
+    // This card is creating the audio element for this URL, so it IS the active
+    // stream — register the URL in context so the MiniBar becomes visible.
+    setActiveHlsUrl(url);
     if (existing) {
       existing.pause();
       existing.src = '';
@@ -230,17 +303,22 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     setError(null);
     setTrackMeta(null);
     setTrackMetaUrl('');
-    setElapsedSec(0);
-    setDurationSec(0);
-    // Immediately show the playlist/track name in the MiniBar while real metadata loads.
-    setActiveHlsMeta(initialTitle ?? 'Live Stream', initialArtist ?? '');
+    setActiveHlsElapsedSec(0);
+    setActiveHlsDurationSec(0);
+    // Only pre-fill MiniBar title/artist when this card IS the active stream.
+    if (url === activeHlsUrlRef.current) {
+      setActiveHlsMeta(initialTitle ?? 'Live Stream', initialArtist ?? '');
+    }
 
-    const audio = new (globalThis as unknown as { Audio: typeof Audio }).Audio(url);
+    const audio = new (globalThis as unknown as { Audio: typeof Audio }).Audio();
+    audio.crossOrigin = 'anonymous'; // required for Web Audio API access
     audio.preload = 'auto';
+    audio.src = url;
+    wireAudioElement(audio); // connect to shared AudioContext/AnalyserNode
 
     const onError = () => { setError('Could not load stream. Check the URL and try again.'); setPlaying(false); setActiveHlsPlaying(false); };
     const onEnded = () => { setPlaying(false); setActiveHlsPlaying(false); };
-    const onPlay  = () => { setPlaying(true);  setActiveHlsPlaying(true); };
+    const onPlay  = () => { setPlaying(true);  setActiveHlsPlaying(true);  setError(null); };
     const onPause = () => { setPlaying(false); setActiveHlsPlaying(false); };
     audio.addEventListener('error', onError);
     audio.addEventListener('ended', onEnded);
@@ -248,13 +326,43 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     audio.addEventListener('pause', onPause);
     audioRef.current = audio;
 
-    audio.play().then(() => { setPlaying(true); setActiveHlsPlaying(true); }).catch(() => { setPlaying(false); setActiveHlsPlaying(false); });
+    // Attempt play() with automatic retry so a stream that isn't fully ready
+    // yet (common right after a server-side playlist is initialised) recovers
+    // without the user having to navigate away and back.
+    const generation = ++retryRef.current;
+    retryCount.current = 0;
+    const MAX_RETRIES = 5;
+    const RETRY_DELAYS = [1000, 2000, 3000, 4000, 5000];
+
+    const attemptPlay = () => {
+      if (generation !== retryRef.current) return; // url changed, abort
+      const a = audioRef.current;
+      if (!a) return;
+      // Clear any previous error as soon as a (re)try begins.
+      setError(null);
+      a.play()
+        .then(() => { setPlaying(true); setActiveHlsPlaying(true); })
+        .catch(() => {
+          setPlaying(false);
+          setActiveHlsPlaying(false);
+          if (generation !== retryRef.current) return;
+          if (retryCount.current < MAX_RETRIES) {
+            const delay = RETRY_DELAYS[retryCount.current] ?? 5000;
+            retryCount.current += 1;
+            retryTimer.current = setTimeout(attemptPlay, delay);
+          }
+        });
+    };
+    attemptPlay();
 
     return () => {
       audio.removeEventListener('error', onError);
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('play',  onPlay);
       audio.removeEventListener('pause', onPause);
+      // Invalidate any pending retry for this url.
+      ++retryRef.current;
+      if (retryTimer.current) { clearTimeout(retryTimer.current); retryTimer.current = null; }
       // Do NOT pause or clear — the element lives in context across navigation.
     };
   }, [url, audioRef, setActiveHlsUrl]);
@@ -269,14 +377,26 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     if (tickerRef.current) { clearInterval(tickerRef.current); tickerRef.current = null; }
     if (!url) return;
     tickerRef.current = setInterval(() => {
+      // Only write shared context state when this card is the active stream.
+      if (url !== activeHlsUrl) return;
       const a = audioRef.current;
       if (!a) return;
-      setElapsedSec(Math.floor(a.currentTime));
+      const elapsed = Math.floor(a.currentTime);
+      setActiveHlsElapsedSec(elapsed);
       const d = a.duration;
-      if (d && isFinite(d)) setDurationSec(Math.floor(d));
+      if (d && isFinite(d)) {
+        const dur = Math.floor(d);
+        setActiveHlsDurationSec(dur);
+        // HLS streams don't reliably fire the 'ended' event. Detect completion
+        // by checking elapsed >= duration while the element is no longer playing.
+        if (elapsed >= dur && (a.paused || a.ended)) {
+          setPlaying(false);
+          setActiveHlsPlaying(false);
+        }
+      }
     }, 1000);
     return () => { if (tickerRef.current) clearInterval(tickerRef.current); };
-  }, [url, audioRef]);
+  }, [url, activeHlsUrl, audioRef]);
 
   // ── Metadata polling ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -286,9 +406,8 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
       if (m) {
         setTrackMeta(m);
         setTrackMetaUrl(url);
-        // For multi-track VOD playlists the position-based effect below updates
-        // the MiniBar on each second tick — don't overwrite with the first track.
-        if (!m.tracks?.length) {
+        // Only push to context if this card is still the active stream.
+        if (!m.tracks?.length && url === activeHlsUrl) {
           setActiveHlsMeta(m.title, m.artist);
         }
       }
@@ -297,24 +416,31 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     const interval = /\.m3u8/i.test(url) ? 8_000 : 20_000;
     metaTimer.current = setInterval(poll, interval);
     return () => { if (metaTimer.current) clearInterval(metaTimer.current); };
-  }, [url]);
+  }, [url, activeHlsUrl]);
 
   // ── Position-based track selection ───────────────────────────────────────
   // When the playlist carries a comment-block track list with a known total
   // duration, derive the currently-playing title/artist from elapsed time so
   // the MiniBar updates as each song changes without any extra network calls.
+  // Guard: only write context metadata when this card IS the active stream —
+  // a background-mounted card (e.g. HomeScreen behind HLSListeningScreen)
+  // would otherwise overwrite the new stream's metadata every elapsed tick.
   useEffect(() => {
+    if (url !== activeHlsUrl) return;
     const tracks = trackMetaUrl === url ? trackMeta?.tracks : undefined;
     const total  = trackMeta?.totalDurationSec;
     if (!tracks?.length || !total || total === 0) return;
-    const idx     = Math.min(Math.floor((elapsedSec / total) * tracks.length), tracks.length - 1);
+    const idx     = Math.min(Math.floor((activeHlsElapsedSec / total) * tracks.length), tracks.length - 1);
     const current = tracks[idx];
     setActiveHlsMeta(current.title, current.artist);
-  }, [elapsedSec, trackMeta, trackMetaUrl, url, setActiveHlsMeta]);
+  }, [activeHlsElapsedSec, trackMeta, trackMetaUrl, url, activeHlsUrl, setActiveHlsMeta]);
 
   // ── MiniBar toggle registration ──────────────────────────────────────────────
   // Register a toggle that directly controls the persisted audio element so
   // the MiniBar works even while this card is unmounted (navigated away).
+  // Do NOT clear on unmount — the audio element survives navigation and the
+  // MiniBar must keep working. The toggle is only cleared when the stream stops
+  // (setActiveHlsUrl('') in context, which calls setHlsStreamCallback(null)).
   useEffect(() => {
     registerHlsToggle(() => {
       const audio = audioRef.current;
@@ -323,31 +449,22 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
       else { audio.pause(); }
       // play/pause event listeners (re-attached on mount) will call setPlaying.
     });
-    return () => registerHlsToggle(null);
   }, [registerHlsToggle, audioRef]);
 
   // ── MiniBar context sync ─────────────────────────────────────────────────
   // Only SET hlsStream — never call setHlsStream(null) from here. Clearing is
   // handled by setActiveHlsUrl('') in context (when stream is explicitly stopped).
-  // title/artist/playing are now in separate stable context fields; hlsStream
-  // only carries elapsedSec (the MiniBar has its own ticker reading hlsAudioRef).
   useEffect(() => {
     if (!url) return;
-    setHlsStream({ elapsedSec });
-  }, [url, elapsedSec, setHlsStream]);
-
-  // On unmount (navigation away), keep hlsStream visible in the MiniBar.
-  // Only clear it when the URL actually goes empty (handled by the effect above).
-  useEffect(() => {
-    return () => { registerHlsToggle(null); };
-  }, [registerHlsToggle]);
+    setHlsStream({ elapsedSec: activeHlsElapsedSec });
+  }, [url, activeHlsElapsedSec, setHlsStream]);
 
   // ── Seek ─────────────────────────────────────────────────────────────────
   const seekFromPress = (locationX: number) => {
-    if (!audioRef.current || barWidth === 0 || durationSec === 0) return;
+    if (!audioRef.current || barWidth === 0 || activeHlsDurationSec === 0) return;
     const ratio = Math.max(0, Math.min(locationX / barWidth, 1));
-    audioRef.current.currentTime = ratio * durationSec;
-    setElapsedSec(Math.floor(ratio * durationSec));
+    audioRef.current.currentTime = ratio * activeHlsDurationSec;
+    setActiveHlsElapsedSec(Math.floor(ratio * activeHlsDurationSec));
   };
 
   if (!url) return null;
@@ -359,12 +476,16 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
     const tracks = trackMetaUrl === url ? trackMeta?.tracks : undefined;
     const total  = trackMeta?.totalDurationSec;
     if (!tracks?.length || !total || total === 0) return null;
-    const idx = Math.min(Math.floor((elapsedSec / total) * tracks.length), tracks.length - 1);
+    const idx = Math.min(Math.floor((activeHlsElapsedSec / total) * tracks.length), tracks.length - 1);
     return tracks[idx];
   })();
 
-  const displayTitle  = currentTrackEntry?.title  ?? trackMeta?.title  ?? initialTitle  ?? 'Live Stream';
-  const displayArtist = currentTrackEntry?.artist ?? trackMeta?.artist ?? initialArtist ?? '';
+  // When this card is the active stream, fall back to the context title/artist
+  // (set by a previously-mounted LivePlayerCard that already fetched metadata)
+  // so re-mounting after navigation doesn't flash 'Live Stream' until re-fetch.
+  const isActive = url === activeHlsUrl;
+  const displayTitle  = currentTrackEntry?.title  ?? trackMeta?.title  ?? (isActive ? activeHlsTitle  : undefined) ?? initialTitle  ?? 'Live Stream';
+  const displayArtist = currentTrackEntry?.artist ?? trackMeta?.artist ?? (isActive ? activeHlsArtist : undefined) ?? initialArtist ?? '';
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -411,14 +532,14 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
         <View style={{ width: 1, height: 36, backgroundColor: '#1E293B' }} />
         <View style={{ alignItems: 'flex-end', justifyContent: 'center', minWidth: 48 }}>
           <Text style={{ color: '#00CAF5', fontSize: 18, fontWeight: '700', fontVariant: ['tabular-nums'] }}>
-            {formatMmSs(elapsedSec)}
+            {formatMmSs(activeHlsElapsedSec)}
           </Text>
           <Text style={{ color: '#334155', fontSize: 9, letterSpacing: 0.5, marginTop: 2 }}>ELAPSED</Text>
         </View>
       </View>
 
       {/* Progress bar */}
-      {durationSec > 0 ? (
+      {activeHlsDurationSec > 0 ? (
         <View style={{ marginBottom: 14 }}>
           <Pressable
             style={{ height: 7, borderRadius: 4, backgroundColor: '#1E293B', marginBottom: 6 }}
@@ -427,18 +548,18 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
           >
             <View style={{
               height: 7, borderRadius: 4, backgroundColor: '#00CAF5',
-              width: `${Math.round(Math.min(elapsedSec / durationSec, 1) * 100)}%`,
+              width: `${Math.round(Math.min(activeHlsElapsedSec / activeHlsDurationSec, 1) * 100)}%`,
             }} />
             <View style={{
               position: 'absolute', top: -10, width: 28, height: 28,
               borderRadius: 14, borderWidth: 2, borderColor: '#00CAF5',
               backgroundColor: '#0F172A',
-              left: barWidth > 0 ? Math.round(Math.min(elapsedSec / durationSec, 1) * barWidth) - 14 : 0,
+              left: barWidth > 0 ? Math.round(Math.min(activeHlsElapsedSec / activeHlsDurationSec, 1) * barWidth) - 14 : 0,
             }} />
           </Pressable>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-            <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatMmSs(elapsedSec)}</Text>
-            <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatMmSs(durationSec)}</Text>
+            <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatMmSs(activeHlsElapsedSec)}</Text>
+            <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatMmSs(activeHlsDurationSec)}</Text>
           </View>
         </View>
       ) : (
@@ -447,7 +568,7 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
             <View style={{ height: 7, borderRadius: 4, backgroundColor: 'rgba(0,202,245,0.25)', width: '100%' }} />
           </View>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 }}>
-            <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatMmSs(elapsedSec)}</Text>
+            <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatMmSs(activeHlsElapsedSec)}</Text>
             <Text style={{ color: '#475569', fontSize: 11 }}>{'∞'}</Text>
           </View>
         </View>
@@ -456,14 +577,14 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
       {/* Transport controls */}
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
         <Pressable
-          onPress={() => setIsShuffle((p) => !p)}
+          onPress={() => toggleActiveHlsShuffle()}
           style={{ width: 40, height: 40, borderRadius: 20, borderWidth: 1, borderColor: '#334155', alignItems: 'center', justifyContent: 'center' }}
         >
-          <MaterialCommunityIcons name="shuffle-variant" size={20} color={isShuffle ? '#00CAF5' : '#94A3B8'} />
+          <MaterialCommunityIcons name="shuffle-variant" size={20} color={activeHlsShuffle ? '#00CAF5' : '#94A3B8'} />
         </Pressable>
 
         <Pressable
-          onPress={() => { if (audioRef.current) { audioRef.current.currentTime = 0; setElapsedSec(0); } }}
+          onPress={() => { if (audioRef.current) { audioRef.current.currentTime = 0; setActiveHlsElapsedSec(0); } }}
           style={{ width: 44, height: 44, borderRadius: 22, borderWidth: 1, borderColor: '#334155', alignItems: 'center', justifyContent: 'center' }}
         >
           <Ionicons name="play-skip-back" size={20} color="#F8FAFC" />
@@ -477,36 +598,38 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist }: Live
             alignItems: 'center', justifyContent: 'center',
           })}
         >
-          <Ionicons name={playing ? 'pause' : 'play'} size={30} color="#0F172A" />
+          <Ionicons name={(isActive ? activeHlsPlaying : playing) ? 'pause' : 'play'} size={30} color="#0F172A" />
         </Pressable>
 
         <Pressable
-          style={{ width: 44, height: 44, borderRadius: 22, borderWidth: 1, borderColor: '#334155', alignItems: 'center', justifyContent: 'center', opacity: 0.4 }}
+          onPress={onNext}
+          disabled={!onNext}
+          style={{ width: 44, height: 44, borderRadius: 22, borderWidth: 1, borderColor: '#334155', alignItems: 'center', justifyContent: 'center', opacity: onNext ? 1 : 0.4 }}
         >
           <Ionicons name="play-skip-forward" size={20} color="#F8FAFC" />
         </Pressable>
 
         <Pressable
-          onPress={() => setIsRepeat((p) => !p)}
+          onPress={() => toggleActiveHlsRepeat()}
           style={{ width: 40, height: 40, borderRadius: 20, borderWidth: 1, borderColor: '#334155', alignItems: 'center', justifyContent: 'center' }}
         >
-          <MaterialCommunityIcons name="repeat" size={20} color={isRepeat ? '#00CAF5' : '#94A3B8'} />
+          <MaterialCommunityIcons name="repeat" size={20} color={activeHlsRepeat ? '#00CAF5' : '#94A3B8'} />
         </Pressable>
       </View>
 
       {/* Secondary controls */}
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
         <Pressable
-          onPress={() => setIsQueue((p) => !p)}
+          onPress={() => toggleActiveHlsQueue()}
           style={{ width: 40, height: 40, borderRadius: 20, borderWidth: 1, borderColor: '#334155', alignItems: 'center', justifyContent: 'center' }}
         >
-          <MaterialIcons name="queue-music" size={18} color={isQueue ? '#00CAF5' : '#94A3B8'} />
+          <MaterialIcons name="queue-music" size={18} color={activeHlsQueue ? '#00CAF5' : '#94A3B8'} />
         </Pressable>
         <Pressable
-          onPress={() => setIsFavorite((p) => !p)}
+          onPress={() => toggleActiveHlsFavorite()}
           style={{ width: 40, height: 40, borderRadius: 20, borderWidth: 1, borderColor: '#334155', alignItems: 'center', justifyContent: 'center' }}
         >
-          <Ionicons name={isFavorite ? 'heart' : 'heart-outline'} size={18} color={isFavorite ? '#00CAF5' : '#94A3B8'} />
+          <Ionicons name={activeHlsFavorite ? 'heart' : 'heart-outline'} size={18} color={activeHlsFavorite ? '#00CAF5' : '#94A3B8'} />
         </Pressable>
       </View>
     </View>

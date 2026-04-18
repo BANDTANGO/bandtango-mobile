@@ -5,6 +5,8 @@ export type Song = {
   duration: string;
   audioUrl?: string;
   albumArtUrl?: string;
+  /** All additional fields returned by the search API, preserved verbatim for server sync. */
+  meta?: Record<string, unknown>;
 };
 
 export type Playlist = {
