@@ -224,10 +224,14 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
     const a = audioRef.current;
     if (!a) return;
     if (a.paused) {
+      // Wire the element to the AudioContext inside this gesture handler —
+      // mobile browsers (Safari/iOS Chrome) only allow AudioContext creation
+      // and resume within a synchronous user-gesture callback.
+      wireAudioElement(a);
+      resumeCtx();
       a.play().catch(() => { setPlaying(false); setActiveHlsPlaying(false); });
       setPlaying(true);
       setActiveHlsPlaying(true);
-      resumeCtx();
     } else {
       a.pause();
       setPlaying(false);
@@ -311,14 +315,16 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
     }
 
     const audio = new (globalThis as unknown as { Audio: typeof Audio }).Audio();
-    audio.crossOrigin = 'anonymous'; // required for Web Audio API access
+    // crossOrigin MUST be set before src for Web Audio API access.
+    // wireAudioElement is called inside the play gesture handler below so
+    // the AudioContext is created within a user gesture (required on mobile).
+    audio.crossOrigin = 'anonymous';
     audio.preload = 'auto';
     audio.src = url;
-    wireAudioElement(audio); // connect to shared AudioContext/AnalyserNode
 
     const onError = () => { setError('Could not load stream. Check the URL and try again.'); setPlaying(false); setActiveHlsPlaying(false); };
     const onEnded = () => { setPlaying(false); setActiveHlsPlaying(false); };
-    const onPlay  = () => { setPlaying(true);  setActiveHlsPlaying(true);  setError(null); };
+    const onPlay  = () => { setPlaying(true);  setActiveHlsPlaying(true);  setError(null); wireAudioElement(audio); resumeCtx(); };
     const onPause = () => { setPlaying(false); setActiveHlsPlaying(false); };
     audio.addEventListener('error', onError);
     audio.addEventListener('ended', onEnded);

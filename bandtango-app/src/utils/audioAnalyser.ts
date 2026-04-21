@@ -15,7 +15,9 @@ let _ctx: AudioContext | null = null;
 let _source: MediaElementAudioSourceNode | null = null;
 let _analyser: AnalyserNode | null = null;
 let _wiredElement: HTMLAudioElement | null = null;
-const FFT_SIZE = 64;
+// 2048 → frequencyBinCount = 1024, covering 0–22 kHz at 44.1 kHz sample rate.
+// Previous value of 64 gave only 32 bins, making bin centers > 31 out-of-range.
+const FFT_SIZE = 2048;
 
 function getCtx(): AudioContext | null {
   if (_ctx) return _ctx;
@@ -54,7 +56,9 @@ export function wireAudioElement(audio: HTMLAudioElement): void {
     if (!_analyser) {
       _analyser = ctx.createAnalyser();
       _analyser.fftSize = FFT_SIZE;
-      _analyser.smoothingTimeConstant = 0.8;
+      // Keep built-in smoothing low — the EMA in EqualizerGraphic handles
+      // temporal smoothing. Double-smoothing was compressing the dynamic range.
+      _analyser.smoothingTimeConstant = 0.2;
     }
     _source.connect(_analyser);
     _wiredElement = audio;
