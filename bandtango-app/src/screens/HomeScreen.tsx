@@ -6,7 +6,6 @@ import { LivePlayerCard } from '../components/LivePlayerCard';
 import { PRESET_STREAMS } from '../data/streamPresets';
 import { Playlist, MainStackParamList } from '../types';
 import { useNowPlaying } from '../state/NowPlayingContext';
-import { getAnalyserData } from '../utils/audioAnalyser';
 
 const LISTEN_BASE = 'http://localhost:7070';
 
@@ -33,132 +32,79 @@ async function fetchAlbumArt(artist: string, title: string): Promise<string | nu
 }
 
 function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | null; playing?: boolean }) {
-  const anims = useRef(BAR_HEIGHTS.map(() => new Animated.Value(1))).current;
-  const pulsesRef = useRef<Animated.CompositeAnimation[]>([]);
-  const rafRef    = useRef<number | null>(null);
-  // Smoothed values — exponential moving average per bar
-  const smoothed  = useRef(new Float32Array(BAR_HEIGHTS.length).fill(0.10));
-  const zeroFrames = useRef(0);
-  const usingRealData = useRef(false);
+  const anims    = useRef(BAR_HEIGHTS.map(() => new Animated.Value(0.15))).current;
+  const rafRef   = useRef<number | null>(null);
+  const smoothed = useRef(new Float32Array(BAR_HEIGHTS.length).fill(0.15));
+  const targets  = useRef(new Float32Array(BAR_HEIGHTS.length).fill(0.15));
+  const nextFlip = useRef(new Float32Array(BAR_HEIGHTS.length).fill(0));
 
   useEffect(() => {
-    pulsesRef.current.forEach((p) => p.stop());
-    pulsesRef.current = [];
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-    smoothed.current.fill(0.25);
-    zeroFrames.current = 0;
-    usingRealData.current = false;
 
     if (playing === false) {
-      // Smoothly settle all bars to their minimum height
       Animated.parallel(
         anims.map((anim) =>
-          Animated.timing(anim, { toValue: 1, duration: 5, useNativeDriver: false })
+          Animated.timing(anim, { toValue: 0.08, duration: 400, useNativeDriver: false })
         )
       ).start();
       return;
     }
 
-    // Log-spaced bin centers across the musically active range (mirrored).
-    // At fftSize=2048, sampleRate=44100: 1 bin ≈ 21.5 Hz.
-    //   bin 4  ≈   86 Hz (sub-bass)
-    //   bin 9  ≈  193 Hz (bass)
-    //   bin 20 ≈  430 Hz (low-mid)
-    //   bin 40 ≈  860 Hz (mid)
-    //   bin 62 ≈ 1333 Hz (upper-mid — more musical energy than 2.5 kHz)
-    const BAR_BIN_CENTERS = [4,  9, 15, 20,  25, 20, 15,  9, 4];
-    // Tighter spread for higher bars = better isolation and less dilution.
-    const BAR_BIN_SPREADS = [3,  3,  3,  4,   5,  4,  3,  3, 3];
-    // High-freq bins still carry less energy — boost them proportionally.
-    const BAR_GAIN        = [1.0, 1.2, 1.6, 2.2, 3.0, 2.2, 1.6, 1.2, 1.0];
-    // Fast attack so beats feel snappy; slow decay so bars glide back down.
-    const ALPHA_ATTACK = 0.55;
-    const ALPHA_DECAY  = 0.45;
-    // Square-root scaling: expands mid-level signals without saturating peaks.
-    const GAMMA = 0.50;
-    // Minimum bar height — low enough that quiet gaps are clearly visible.
-    const BAR_FLOOR = 0.05;
+    const N = BAR_HEIGHTS.length;
+    // Each bar flips to a new target at its own rate (ms) — outer bars faster for punchier bass feel
+    const FLIP_INTERVALS = [180, 220, 270, 320, 370, 320, 270, 220, 180];
+    const ALPHA_ATTACK = 0.35; // snappy rise
+    const ALPHA_DECAY  = 0.08; // slow glide-down
+    const FLOOR = 0.08;
 
-    const startSimulated = () => {
-      if (pulsesRef.current.length) return; // already running
-      // Stagger start phases so bars don't all move in lockstep
-      const phases = [0, 0.22, 0.44, 0.66, 0.88, 0.66, 0.44, 0.22, 0];
-      pulsesRef.current = anims.map((anim, i) => {
-        const duration = 600 + i * 60;
-        const pulse = Animated.loop(
-          Animated.sequence([
-            Animated.timing(anim, { toValue: BAR_FLOOR, duration, useNativeDriver: false }),
-            Animated.timing(anim, { toValue: 1,         duration, useNativeDriver: false }),
-          ])
-        );
-        // Start each bar offset into its cycle so they're naturally staggered
-        anim.setValue(phases[i]);
-        return pulse;
-      });
-      pulsesRef.current.forEach((p) => p.start());
-    };
+    // Stagger initial flip times so bars don't all change together on mount
+    const now = performance.now();
+    for (let i = 0; i < N; i++) {
+      nextFlip.current[i] = now + Math.random() * FLIP_INTERVALS[i];
+      smoothed.current[i] = 0.15 + Math.random() * 0.3;
+    }
 
-    // Start simulated immediately — guarantees animation on all platforms
-    // (iOS Safari cannot tap into HLS streams via Web Audio at all).
-    // If real frequency data flows in, tick() will stop simulated and take over.
-    startSimulated();
+    let lastBeat = now;
+    const BEAT_INTERVAL = 450;
 
-    const tick = () => {
+    const tick = (t: number) => {
       rafRef.current = requestAnimationFrame(tick);
-      const result = getAnalyserData();
 
-      // No analyser connected yet — simulated is already running, nothing to do
-      if (!result) return;
-
-      const { data, binCount } = result;
-      const allZero = data.every((v) => v === 0);
-
-      if (allZero) {
-        zeroFrames.current += 1;
-        // After ~0.5 s of confirmed zeros, stop checking — we're on a platform
-        // where the analyser can't read this stream (iOS HLS, CORS block, etc.).
-        // Simulated is already running so just cancel the RAF to save CPU.
-        if (zeroFrames.current > 30) {
-          if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-        }
-        return;
+      // Global beat pulse — spikes 2 outer/bass bars on a musical interval
+      if (t - lastBeat > BEAT_INTERVAL + Math.random() * 120) {
+        lastBeat = t;
+        const beatBars = [
+          Math.floor(Math.random() * 3),
+          N - 1 - Math.floor(Math.random() * 3),
+        ];
+        beatBars.forEach((b) => { targets.current[b] = 0.75 + Math.random() * 0.25; });
       }
 
-      // Real data is flowing — stop simulated and drive bars from frequency data
-      if (pulsesRef.current.length) {
-        pulsesRef.current.forEach((p) => p.stop());
-        pulsesRef.current = [];
-      }
-      zeroFrames.current = 0;
-      usingRealData.current = true;
-
-      anims.forEach((anim, i) => {
-        // Average bins within this bar's spread for its frequency band
-        const center = BAR_BIN_CENTERS[i];
-        const spread = BAR_BIN_SPREADS[i];
-        let sum = 0, count = 0;
-        for (let b = center - spread; b <= center + spread; b++) {
-          if (b >= 0 && b < binCount) { sum += data[b]; count++; }
+      // Per-bar: pick a new target whenever this bar's timer expires
+      for (let i = 0; i < N; i++) {
+        if (t >= nextFlip.current[i]) {
+          const isMid = i === Math.floor(N / 2);
+          const lo = isMid ? 0.15 : 0.10;
+          const hi = isMid ? 0.70 : 0.88;
+          targets.current[i] = lo + Math.random() * (hi - lo);
+          nextFlip.current[i] = t + FLIP_INTERVALS[i] * (0.7 + Math.random() * 0.6);
         }
-        // Apply per-bar gain before normalising so high-freq bars reach full height
-        const raw    = count > 0 ? Math.min(1, (sum / count / 255) * BAR_GAIN[i]) : 0;
-        // Gamma expand: stretches quiet signals across more of the bar height
-        const curved = Math.pow(raw, GAMMA);
-        const target = Math.max(BAR_FLOOR, curved);
+      }
+
+      // Exponential smoothing → push to Animated.Value
+      for (let i = 0; i < N; i++) {
+        const target = Math.max(FLOOR, targets.current[i]);
         const prev   = smoothed.current[i];
-        // Exponential moving average: different coefficients for rising vs falling
         const alpha  = target > prev ? ALPHA_ATTACK : ALPHA_DECAY;
         const next   = prev + (target - prev) * alpha;
         smoothed.current[i] = next;
-        anim.setValue(next);
-      });
+        anims[i].setValue(next);
+      }
     };
 
     rafRef.current = requestAnimationFrame(tick);
 
     return () => {
-      pulsesRef.current.forEach((p) => p.stop());
-      pulsesRef.current = [];
       if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
     };
   }, [playing, anims]);
