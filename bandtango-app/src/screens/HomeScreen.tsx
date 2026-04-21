@@ -71,7 +71,6 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
     const BAR_BIN_SPREADS = [3,  3,  3,  4,   5,  4,  3,  3, 3];
     // High-freq bins still carry less energy — boost them proportionally.
     const BAR_GAIN        = [1.0, 1.2, 1.6, 2.2, 3.0, 2.2, 1.6, 1.2, 1.0];
-    const ZERO_FRAME_THRESHOLD = 60; // ~1 s at 60 fps before falling back
     // Fast attack so beats feel snappy; slow decay so bars glide back down.
     const ALPHA_ATTACK = 0.55;
     const ALPHA_DECAY  = 0.45;
@@ -82,39 +81,50 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
 
     const startSimulated = () => {
       if (pulsesRef.current.length) return; // already running
+      // Stagger start phases so bars don't all move in lockstep
+      const phases = [0, 0.22, 0.44, 0.66, 0.88, 0.66, 0.44, 0.22, 0];
       pulsesRef.current = anims.map((anim, i) => {
-        const duration = 400 + i * 80;
-        return Animated.loop(
+        const duration = 600 + i * 60;
+        const pulse = Animated.loop(
           Animated.sequence([
             Animated.timing(anim, { toValue: BAR_FLOOR, duration, useNativeDriver: false }),
-            Animated.timing(anim, { toValue: 1,    duration, useNativeDriver: false }),
+            Animated.timing(anim, { toValue: 1,         duration, useNativeDriver: false }),
           ])
         );
+        // Start each bar offset into its cycle so they're naturally staggered
+        anim.setValue(phases[i]);
+        return pulse;
       });
       pulsesRef.current.forEach((p) => p.start());
     };
+
+    // Start simulated immediately — guarantees animation on all platforms
+    // (iOS Safari cannot tap into HLS streams via Web Audio at all).
+    // If real frequency data flows in, tick() will stop simulated and take over.
+    startSimulated();
 
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
       const result = getAnalyserData();
 
-      if (!result) {
-        startSimulated();
-        return;
-      }
+      // No analyser connected yet — simulated is already running, nothing to do
+      if (!result) return;
 
       const { data, binCount } = result;
       const allZero = data.every((v) => v === 0);
 
       if (allZero) {
         zeroFrames.current += 1;
-        if (zeroFrames.current > ZERO_FRAME_THRESHOLD) {
-          startSimulated();
+        // After ~0.5 s of confirmed zeros, stop checking — we're on a platform
+        // where the analyser can't read this stream (iOS HLS, CORS block, etc.).
+        // Simulated is already running so just cancel the RAF to save CPU.
+        if (zeroFrames.current > 30) {
+          if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
         }
         return;
       }
 
-      // Real data is flowing — stop simulated animation if it was running
+      // Real data is flowing — stop simulated and drive bars from frequency data
       if (pulsesRef.current.length) {
         pulsesRef.current.forEach((p) => p.stop());
         pulsesRef.current = [];
