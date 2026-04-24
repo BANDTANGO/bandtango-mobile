@@ -16,27 +16,46 @@ type PlaylistsScreenProps = {
   apiError: string;
 };
 
-function PlaylistRow({ onPress, last, children }: { onPress?: () => void; last?: boolean; children: React.ReactNode }) {
+const HOVER_BG = 'rgba(0, 202, 245, 0.08)';
+const SELECTED_BG = 'rgba(0, 202, 245, 0.13)';
+const SELECTED_BORDER = '#00CAF5';
+const DEFAULT_BORDER = 'rgba(106, 120, 160, 0.85)';
+
+function PlaylistRow({ onPress, last, selected, children }: { onPress?: () => void; last?: boolean; selected?: boolean; children: React.ReactNode }) {
   return (
     <Pressable
       onPress={onPress}
-      style={{ borderRadius: 12, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(106, 120, 160, 0.85)', marginBottom: last ? 0 : 12 }}
+      style={({ hovered }: any) => ({
+        borderRadius: 12,
+        overflow: 'hidden',
+        borderWidth: selected ? 1.5 : 1,
+        borderColor: selected ? SELECTED_BORDER : DEFAULT_BORDER,
+        marginBottom: last ? 0 : 12,
+      })}
     >
-      <LinearGradient
-        colors={['#6a78a0', '#455380', 'rgba(25,29,62,0.12)', '#455380', '#6a78a0']}
-        start={{ x: 1.0, y: 0.2 }}
-        end={{ x: 0.5, y: 1.25 }}
-        style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}
-      />
-      <View style={{ padding: 14 }}>
-        {children}
-      </View>
+      {({ hovered }: any) => (
+        <>
+          <LinearGradient
+            colors={['#6a78a0', '#455380', 'rgba(25,29,62,0.12)', '#455380', '#6a78a0']}
+            start={{ x: 1.0, y: 0.2 }}
+            end={{ x: 0.5, y: 1.25 }}
+            style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}
+          />
+          {(hovered || selected) && (
+            <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: selected ? SELECTED_BG : HOVER_BG }} pointerEvents="none" />
+          )}
+          <View style={{ padding: 14 }}>
+            {children}
+          </View>
+        </>
+      )}
     </Pressable>
   );
 }
 
 export function PlaylistsScreen({ navigation, playlists, apiPlaylists, apiLoading, apiError }: PlaylistsScreenProps) {
   const [editMode, setEditMode] = useState(false);
+  const [selectedPlaylist, setSelectedPlaylist] = useState<string | null>(null);
   const { setActiveHlsUrl, hlsAudioRef } = useNowPlaying();
 
   const handleApiPlaylistPress = async (playlist: Playlist) => {
@@ -118,13 +137,11 @@ export function PlaylistsScreen({ navigation, playlists, apiPlaylists, apiLoadin
               <PlaylistRow
                 key={playlist.id}
                 last={index === playlists.length - 1}
-                onPress={() =>
-                  !editMode &&
-                  navigation.navigate('Home', {
-                    playlistId: playlist.id,
-                    playlistName: playlist.name,
-                  })
-                }
+                selected={selectedPlaylist === playlist.id}
+                onPress={() => {
+                  setSelectedPlaylist(selectedPlaylist === playlist.id ? null : playlist.id);
+                  if (!editMode) navigation.navigate('Home', { playlistId: playlist.id, playlistName: playlist.name });
+                }}
               >
                 <View className="mb-1.5 flex-row items-center justify-between">
                   <Text className="text-base font-semibold text-[#F8FAFC]">
@@ -178,7 +195,11 @@ export function PlaylistsScreen({ navigation, playlists, apiPlaylists, apiLoadin
           <PlaylistRow
             key={playlist.id}
             last={index === apiPlaylists.length - 1}
-            onPress={() => handleApiPlaylistPress(playlist)}
+            selected={selectedPlaylist === playlist.id}
+            onPress={() => {
+              setSelectedPlaylist(selectedPlaylist === playlist.id ? null : playlist.id);
+              handleApiPlaylistPress(playlist);
+            }}
           >
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
               <Text style={{ color: '#F8FAFC', fontSize: 15, fontWeight: '600', flex: 1 }} numberOfLines={1}>

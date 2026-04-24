@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { LayoutChangeEvent, Pressable, Text, View } from 'react-native';
 import { useNowPlaying } from '../state/NowPlayingContext';
 import { wireAudioElement, resumeCtx } from '../utils/audioAnalyser';
+import { fetchIcyMeta } from '../utils/icyMetadata';
 
 // ── Metadata helpers ────────────────────────────────────────────────────────
 
@@ -145,6 +146,11 @@ async function fetchMeta(url: string): Promise<TrackMeta | null> {
   const somaId = SOMA_META_IDS[url];
   if (somaId) return fetchSomaFmMeta(somaId);
   if (/\.m3u8/i.test(url)) return fetchHlsMeta(url);
+  // Static files (MP3, etc.) are not ICY streams — skip the metadata probe.
+  if (/\.(mp3|aac|ogg|flac|wav|opus|m4a)(\?.*)?$/i.test(url)) return null;
+  // Fallback: plain Icecast / ShoutCast stream — proxy through backend.
+  const icy = await fetchIcyMeta(url);
+  if (icy) return { artist: icy.artist, title: icy.title };
   return null;
 }
 
@@ -198,7 +204,7 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
   const [barWidth,     setBarWidth]     = useState(0);
 
   const audioRef    = hlsAudioRef;
-  const metaTimer   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const metaTimer   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tickerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
   // retryRef: monotonic generation counter — incremented on url change so stale
   // retry timeouts from a previous url never fire against the new audio element.
@@ -279,7 +285,7 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
 
       const onError = () => { setError('Could not load stream. Check the URL and try again.'); setPlaying(false); setActiveHlsPlaying(false); };
       const onEnded = () => { setPlaying(false); setActiveHlsPlaying(false); };
-      const onPlay  = () => { setPlaying(true);  setActiveHlsPlaying(true); };
+      const onPlay  = () => { setPlaying(true);  setActiveHlsPlaying(true);  setError(null); };
       const onPause = () => { setPlaying(false); setActiveHlsPlaying(false); };
       existing.addEventListener('error', onError);
       existing.addEventListener('ended', onEnded);
@@ -315,10 +321,14 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
     }
 
     const audio = new (globalThis as unknown as { Audio: typeof Audio }).Audio();
-    // crossOrigin MUST be set before src for Web Audio API access.
-    // wireAudioElement is called inside the play gesture handler below so
-    // the AudioContext is created within a user gesture (required on mobile).
-    audio.crossOrigin = 'anonymous';
+    // crossOrigin='anonymous' enables the Web Audio analyser (needed for the
+    // equalizer graphic) but forces CORS mode — static file hosts (MP3, AAC,
+    // etc.) don't serve Access-Control-Allow-Origin headers and will be
+    // blocked. Only set it for live/HLS streams where CORS headers ARE present.
+    const isStaticFile = /\.(mp3|aac|ogg|flac|wav|opus|m4a)(\?.*)?$/i.test(url);
+    if (!isStaticFile) {
+      audio.crossOrigin = 'anonymous';
+    }
     audio.preload = 'auto';
     audio.src = url;
 
@@ -378,15 +388,28 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
   // caused UI flicker by calling play()/pause() which fired onPlay/onPause events
   // that in turn triggered setPlaying → re-triggering the effect in a loop.
 
+  // ── Clear error whenever playback is active ──────────────────────────────
+  useEffect(() => {
+    if (playing) setError(null);
+  }, [playing]);
+
   // ── Ticker ───────────────────────────────────────────────────────────────
   useEffect(() => {
     if (tickerRef.current) { clearInterval(tickerRef.current); tickerRef.current = null; }
     if (!url) return;
     tickerRef.current = setInterval(() => {
-      // Only write shared context state when this card is the active stream.
-      if (url !== activeHlsUrl) return;
       const a = audioRef.current;
       if (!a) return;
+      // If the audio element is actively playing, ensure error is cleared and
+      // playing state is in sync — guards against stale error banners after
+      // a stream recovers without firing a 'play' event.
+      if (!a.paused && !a.ended) {
+        setError(null);
+        setPlaying(true);
+        setActiveHlsPlaying(true);
+      }
+      // Only write shared context state when this card is the active stream.
+      if (url !== activeHlsUrl) return;
       const elapsed = Math.floor(a.currentTime);
       setActiveHlsElapsedSec(elapsed);
       const d = a.duration;
@@ -405,23 +428,56 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
   }, [url, activeHlsUrl, audioRef]);
 
   // ── Metadata polling ─────────────────────────────────────────────────────
+  // Uses self-scheduling setTimeout instead of setInterval so each poll waits
+  // for the previous fetch to finish before scheduling the next one. Also
+  // listens for visibilitychange to immediately re-poll when the tab comes back
+  // to the foreground (browsers suspend/throttle timers in background tabs).
+  // Burst pattern: 3 polls 8 s apart, then a 30 s cooldown, then repeat.
   useEffect(() => {
-    if (metaTimer.current) { clearInterval(metaTimer.current); metaTimer.current = null; }
+    if (metaTimer.current) { clearTimeout(metaTimer.current); metaTimer.current = null; }
     if (!url) return;
-    const poll = () => fetchMeta(url).then((m) => {
-      if (m) {
-        setTrackMeta(m);
-        setTrackMetaUrl(url);
-        // Only push to context if this card is still the active stream.
-        if (!m.tracks?.length && url === activeHlsUrl) {
-          setActiveHlsMeta(m.title, m.artist);
-        }
+    let cancelled = false;
+    let burstCount = 0;          // how many polls fired in the current burst
+    const BURST_SIZE    = 3;
+    const BURST_GAP_MS  = 8_000;
+    const COOLDOWN_MS   = 30_000;
+    const schedule = () => {
+      burstCount += 1;
+      const delay = burstCount < BURST_SIZE ? BURST_GAP_MS : COOLDOWN_MS;
+      if (burstCount >= BURST_SIZE) burstCount = 0; // reset for next burst
+      if (!cancelled) metaTimer.current = setTimeout(runPoll, delay);
+    };
+    const runPoll = () => {
+      if (cancelled) return;
+      fetchMeta(url)
+        .then((m) => {
+          if (cancelled || !m) return;
+          setTrackMeta(m);
+          setTrackMetaUrl(url);
+          // Only push to context if this card is still the active stream.
+          if (!m.tracks?.length && url === activeHlsUrl) {
+            setActiveHlsMeta(m.title, m.artist);
+          }
+        })
+        .catch(() => { /* swallow — schedule will still fire */ })
+        .finally(schedule);
+    };
+    // Immediate first fetch, then chain.
+    runPoll();
+    // Re-poll instantly when the browser tab becomes visible again; reset burst.
+    const onVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        if (metaTimer.current) { clearTimeout(metaTimer.current); metaTimer.current = null; }
+        burstCount = 0;
+        runPoll();
       }
-    });
-    poll();
-    const interval = /\.m3u8/i.test(url) ? 8_000 : 20_000;
-    metaTimer.current = setInterval(poll, interval);
-    return () => { if (metaTimer.current) clearInterval(metaTimer.current); };
+    };
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      if (metaTimer.current) { clearTimeout(metaTimer.current); metaTimer.current = null; }
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [url, activeHlsUrl]);
 
   // ── Position-based track selection ───────────────────────────────────────
@@ -475,23 +531,31 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
 
   if (!url) return null;
 
+  const isActive = url === activeHlsUrl;
+  // Gate local metadata on URL match — prevents stale trackMeta from a
+  // previously-played URL shadowing the correct context values.
+  const localMeta = trackMetaUrl === url ? trackMeta : null;
+
   // When the playlist carries a multi-track list, derive the currently-playing
   // track by position so the card title/artist updates as each song changes —
   // identical logic to the setActiveHlsMeta effect above.
   const currentTrackEntry = (() => {
-    const tracks = trackMetaUrl === url ? trackMeta?.tracks : undefined;
-    const total  = trackMeta?.totalDurationSec;
+    const tracks = localMeta?.tracks;
+    const total  = localMeta?.totalDurationSec;
     if (!tracks?.length || !total || total === 0) return null;
     const idx = Math.min(Math.floor((activeHlsElapsedSec / total) * tracks.length), tracks.length - 1);
     return tracks[idx];
   })();
 
-  // When this card is the active stream, fall back to the context title/artist
-  // (set by a previously-mounted LivePlayerCard that already fetched metadata)
-  // so re-mounting after navigation doesn't flash 'Live Stream' until re-fetch.
-  const isActive = url === activeHlsUrl;
-  const displayTitle  = currentTrackEntry?.title  ?? trackMeta?.title  ?? (isActive ? activeHlsTitle  : undefined) ?? initialTitle  ?? 'Live Stream';
-  const displayArtist = currentTrackEntry?.artist ?? trackMeta?.artist ?? (isActive ? activeHlsArtist : undefined) ?? initialArtist ?? '';
+  // Priority for title/artist:
+  //   1. Position-derived track entry (multi-track HLS playlists)
+  //   2. Context values (activeHlsTitle/activeHlsArtist) — shared between ALL
+  //      LivePlayerCard instances, so HomeScreen and HLSListeningScreen always
+  //      agree. The metadata poll writes here, so this is the source of truth.
+  //   3. Local fetch result (fallback before the first context write completes)
+  //   4. initialTitle/initialArtist props
+  const displayTitle  = currentTrackEntry?.title  ?? (isActive ? activeHlsTitle  : undefined) ?? localMeta?.title  ?? initialTitle  ?? 'Live Stream';
+  const displayArtist = currentTrackEntry?.artist ?? (isActive ? activeHlsArtist : undefined) ?? localMeta?.artist ?? initialArtist ?? '';
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -502,14 +566,12 @@ export function LivePlayerCard({ url, label, initialTitle, initialArtist, autopl
       borderColor: 'rgba(51, 65, 85, 0.6)',
       padding: 16,
     }}>
-      {/* Header: LIVE dot + label */}
-      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
-        <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#EF4444', marginRight: 6 }} />
-        <Text style={{ color: '#EF4444', fontSize: 10, fontWeight: '700', letterSpacing: 1, marginRight: 8 }}>LIVE</Text>
-        {label ? (
+      {/* Header: label */}
+      {label ? (
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
           <Text style={{ color: '#94A3B8', fontSize: 12, flex: 1 }} numberOfLines={1}>{label}</Text>
-        ) : null}
-      </View>
+        </View>
+      ) : null}
 
       {/* Error */}
       {error ? (

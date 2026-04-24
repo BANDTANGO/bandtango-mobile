@@ -6,6 +6,7 @@ import { LivePlayerCard } from '../components/LivePlayerCard';
 import { PRESET_STREAMS } from '../data/streamPresets';
 import { Playlist, MainStackParamList } from '../types';
 import { useNowPlaying } from '../state/NowPlayingContext';
+import { getAnalyserData } from '../utils/audioAnalyser';
 
 const LISTEN_BASE = 'http://localhost:7070';
 
@@ -38,8 +39,21 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
   const targets  = useRef(new Float32Array(BAR_HEIGHTS.length).fill(0.15));
   const nextFlip = useRef(new Float32Array(BAR_HEIGHTS.length).fill(0));
 
+  // FFT band → bar index mapping (symmetric: outer=bass, inner=high-mid)
+  // With FFT 2048, binCount=1024, bin width≈21.5 Hz at 44.1 kHz
+  // [lo, hi) bin ranges for 5 bands that drive bars [0&8, 1&7, 2&6, 3&5, 4]
+  const BAND_BINS: [number, number][] = [
+    [1,   5  ],  // sub-bass  → bars 0 & 8
+    [5,   18 ],  // bass      → bars 1 & 7
+    [18,  60 ],  // low-mid   → bars 2 & 6
+    [60,  180],  // mid       → bars 3 & 5
+    [180, 450],  // high-mid  → bar  4
+  ];
+  const BAR_BAND = [0, 1, 2, 3, 4, 3, 2, 1, 0];
+
   useEffect(() => {
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    anims.forEach((anim) => anim.stopAnimation());
 
     if (playing === false) {
       Animated.parallel(
@@ -51,13 +65,11 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
     }
 
     const N = BAR_HEIGHTS.length;
-    // Each bar flips to a new target at its own rate (ms) — outer bars faster for punchier bass feel
     const FLIP_INTERVALS = [180, 220, 270, 320, 370, 320, 270, 220, 180];
-    const ALPHA_ATTACK = 0.35; // snappy rise
-    const ALPHA_DECAY  = 0.08; // slow glide-down
+    const ALPHA_ATTACK = 0.35;
+    const ALPHA_DECAY  = 0.08;
     const FLOOR = 0.08;
 
-    // Stagger initial flip times so bars don't all change together on mount
     const now = performance.now();
     for (let i = 0; i < N; i++) {
       nextFlip.current[i] = now + Math.random() * FLIP_INTERVALS[i];
@@ -70,24 +82,45 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
     const tick = (t: number) => {
       rafRef.current = requestAnimationFrame(tick);
 
-      // Global beat pulse — spikes 2 outer/bass bars on a musical interval
-      if (t - lastBeat > BEAT_INTERVAL + Math.random() * 120) {
-        lastBeat = t;
-        const beatBars = [
-          Math.floor(Math.random() * 3),
-          N - 1 - Math.floor(Math.random() * 3),
-        ];
-        beatBars.forEach((b) => { targets.current[b] = 0.75 + Math.random() * 0.25; });
+      // ── Real analyser data (when Web Audio is wired) ──────────────────
+      const realData = getAnalyserData();
+      let usedReal = false;
+
+      if (realData) {
+        const { data, binCount } = realData;
+        // Check for actual signal — all-zero means the analyser isn't wired yet
+        let sum = 0;
+        const checkLen = Math.min(512, binCount);
+        for (let i = 0; i < checkLen; i++) sum += data[i];
+
+        if (sum > 50) {
+          usedReal = true;
+          const bandVals = BAND_BINS.map(([lo, hi]) => {
+            const safeHi = Math.min(hi, binCount - 1);
+            let acc = 0;
+            const len = safeHi - lo;
+            for (let b = lo; b < safeHi; b++) acc += data[b];
+            return len > 0 ? acc / len / 255 : 0;
+          });
+          for (let i = 0; i < N; i++) {
+            targets.current[i] = Math.max(FLOOR, bandVals[BAR_BAND[i]] * 0.95 + 0.05);
+          }
+        }
       }
 
-      // Per-bar: pick a new target whenever this bar's timer expires
-      for (let i = 0; i < N; i++) {
-        if (t >= nextFlip.current[i]) {
-          const isMid = i === Math.floor(N / 2);
-          const lo = isMid ? 0.15 : 0.10;
-          const hi = isMid ? 0.70 : 0.88;
-          targets.current[i] = lo + Math.random() * (hi - lo);
-          nextFlip.current[i] = t + FLIP_INTERVALS[i] * (0.7 + Math.random() * 0.6);
+      if (!usedReal) {
+        // ── Simulation fallback ─────────────────────────────────────────
+        if (t - lastBeat > BEAT_INTERVAL + Math.random() * 120) {
+          lastBeat = t;
+          [Math.floor(Math.random() * 3), N - 1 - Math.floor(Math.random() * 3)]
+            .forEach((b) => { targets.current[b] = 0.75 + Math.random() * 0.25; });
+        }
+        for (let i = 0; i < N; i++) {
+          if (t >= nextFlip.current[i]) {
+            const isMid = i === Math.floor(N / 2);
+            targets.current[i] = (isMid ? 0.15 : 0.10) + Math.random() * (isMid ? 0.55 : 0.78);
+            nextFlip.current[i] = t + FLIP_INTERVALS[i] * (0.7 + Math.random() * 0.6);
+          }
         }
       }
 
@@ -96,17 +129,13 @@ function EqualizerGraphic({ albumArtUrl, playing }: { albumArtUrl?: string | nul
         const target = Math.max(FLOOR, targets.current[i]);
         const prev   = smoothed.current[i];
         const alpha  = target > prev ? ALPHA_ATTACK : ALPHA_DECAY;
-        const next   = prev + (target - prev) * alpha;
-        smoothed.current[i] = next;
-        anims[i].setValue(next);
+        smoothed.current[i] = prev + (target - prev) * alpha;
+        anims[i].setValue(smoothed.current[i]);
       }
     };
 
     rafRef.current = requestAnimationFrame(tick);
-
-    return () => {
-      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-    };
+    return () => { if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; } };
   }, [playing, anims]);
 
   return (
@@ -154,7 +183,7 @@ type HomeScreenProps = NativeStackScreenProps<MainStackParamList, 'Home'> & {
 };
 
 export function HomeScreen({ navigation, playlists, apiPlaylistIds, route }: HomeScreenProps) {
-  const { activeHlsTitle, activeHlsArtist, activeHlsPlaying, activeHlsUrl, activeHlsElapsedSec, setActiveHlsUrl } = useNowPlaying();
+  const { activeHlsTitle, activeHlsArtist, activeHlsPlaying, activeHlsUrl, activeHlsElapsedSec, setActiveHlsUrl, activeHlsLabel } = useNowPlaying();
   const [albumArtUrl, setAlbumArtUrl] = useState<string | null>(null);
   const [listenHlsUrl, setListenHlsUrl] = useState<string | null>(null);
   navigation.setOptions({
@@ -242,16 +271,26 @@ export function HomeScreen({ navigation, playlists, apiPlaylistIds, route }: Hom
   // Three distinct cases:
   // 1. Server playlist: activeHlsUrl is ground truth (updated by listen fetch).
   //    Fall back to listenHlsUrl while the context hasn't been updated yet.
-  // 2. Local playlist: prefer the static track audioUrl; fall back to activeHlsUrl.
-  // 3. No playlist selected (preset): use activeHlsUrl.
+  // 2. Local playlist explicitly selected: prefer the static track audioUrl.
+  // 3. No playlist selected — a preset/HLS stream may be active in context:
+  //    ALWAYS prefer activeHlsUrl so the LivePlayerCard adopts the currently
+  //    playing stream. Using localUrl (first seed song) here would give the card
+  //    a different URL from the active stream, making isActive=false and causing
+  //    artist/title from context to be ignored.
   const cardUrl = isServerPlaylist
     ? (activeHlsUrl || listenHlsUrl || '')
-    : (localUrl || activeHlsUrl || '');
+    : selectedPlaylist
+      ? (localUrl || activeHlsUrl || '')
+      : (activeHlsUrl || localUrl || '');
   const isLoadingStream = isServerPlaylist && !cardUrl;
   const activePreset = PRESET_STREAMS.find((s) => s.url === cardUrl);
-  const cardLabel         = activePreset?.label ?? selectedPlaylist?.name ?? featuredTrack?.title;
-  const cardInitialTitle  = activePreset?.label ?? featuredTrack?.title;
-  const cardInitialArtist = activePreset ? '' : featuredTrack?.artist;
+  const cardLabel         = activeHlsLabel || activePreset?.label || selectedPlaylist?.name || featuredTrack?.title;
+  // When a live/HLS stream is active use context metadata as initial values so
+  // the card shows the correct artist/title immediately on mount without waiting
+  // for its own metadata fetch to complete.
+  const isLiveStream = !!cardUrl && cardUrl === activeHlsUrl;
+  const cardInitialTitle  = activePreset?.label ?? (isLiveStream ? activeHlsTitle  : undefined) ?? featuredTrack?.title;
+  const cardInitialArtist = activePreset ? ''   : (isLiveStream ? activeHlsArtist : undefined) ?? featuredTrack?.artist;
 
   // ── Skip-forward handler ────────────────────────────────────────────────
   // Only available for server playlists with more than one song.

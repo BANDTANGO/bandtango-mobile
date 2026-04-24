@@ -1,6 +1,6 @@
 import { Platform } from 'react-native';
 import { createPlayer, PlayerInstance } from '../utils/audioPlayer';
-import { PRESET_STREAMS, isCorsSafeUrl } from '../data/streamPresets';
+import { PRESET_STREAMS } from '../data/streamPresets';
 import { fetchIcyMeta } from '../utils/icyMetadata';
 import {
   createContext,
@@ -56,13 +56,17 @@ async function fetchContextMeta(url: string): Promise<{ title: string; artist: s
   // the artist/title to flicker back to Track 1 every 20 s.
   if (/\.m3u8/i.test(url)) return null;
 
+  // ── Skip static audio files — they are not ICY streams ─────────────────
+  // fetchIcyMeta sends non-simple headers (Icy-MetaData) that trigger a CORS
+  // preflight. Static MP3/AAC/OGG servers never include that header anyway.
+  if (/\.(mp3|aac|ogg|flac|wav|opus|m4a)(\?.*)?$/i.test(url)) return null;
+
   // ── Icecast / ShoutCast: ICY byte-offset metadata ─────────────────────
   // Only attempt the streaming fetch for origins that are verified to send
   // CORS headers — avoids a wasted 12 s timeout on CORS-blocked servers.
-  if (isCorsSafeUrl(url)) {
-    const icy = await fetchIcyMeta(url);
-    if (icy) return { title: icy.title, artist: icy.artist };
-  }
+  // The ICY fetch is now proxied through the backend — no CORS restrictions.
+  const icy = await fetchIcyMeta(url);
+  if (icy) return { title: icy.title, artist: icy.artist };
   return null;
 }
 
@@ -107,6 +111,9 @@ type NowPlayingContextValue = {
   /** Single source of truth for what HLS URL is currently active. */
   activeHlsUrl: string;
   setActiveHlsUrl: (url: string) => void;
+  /** Human-readable name for the active stream (station/playlist name). */
+  activeHlsLabel: string;
+  setActiveHlsLabel: (label: string) => void;
   /** Stable title/artist — only updates when metadata genuinely changes, not every ticker tick. */
   activeHlsTitle: string;
   activeHlsArtist: string;
@@ -189,8 +196,10 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
   // Single source of truth for the active HLS URL — stable across re-renders.
   const [activeHlsUrl, setActiveHlsUrlState] = useState<string>('');
   // Stable title/artist: set by LivePlayerCard from metadata fetch, not updated every tick.
+  const [activeHlsLabel,  setActiveHlsLabelState]  = useState('');
   const [activeHlsTitle,  setActiveHlsTitleState]  = useState('');
   const [activeHlsArtist, setActiveHlsArtistState] = useState('');
+  const setActiveHlsLabel = useCallback((label: string) => setActiveHlsLabelState(label), []);
   const [activeHlsPlaying, setActiveHlsPlayingState] = useState(false);
   const setActiveHlsPlaying = useCallback((playing: boolean) => {
     setActiveHlsPlayingState(playing);
@@ -225,6 +234,7 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
     // Only clear stale metadata when the URL actually changes, not on redundant calls
     // (e.g. HLSListeningScreen card and handleStart both calling with the same URL).
     if (url !== prev) {
+      setActiveHlsLabelState('');
       setActiveHlsTitleState('');
       setActiveHlsArtistState('');
     }
@@ -247,23 +257,55 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
   // any) is currently mounted. LivePlayerCard's own polling takes precedence for
   // multi-track VOD playlists (positional switching) — this handles live presets
   // and any stream not covered by a mounted card.
-  const ctxMetaPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const ctxMetaPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    if (ctxMetaPollRef.current) { clearInterval(ctxMetaPollRef.current); ctxMetaPollRef.current = null; }
+    if (ctxMetaPollRef.current) { clearTimeout(ctxMetaPollRef.current); ctxMetaPollRef.current = null; }
     if (!activeHlsUrl) return;
-    const poll = () =>
-      fetchContextMeta(activeHlsUrl).then((m) => {
-        if (m) {
+    let cancelled = false;
+    let burstCount = 0;
+    const BURST_SIZE   = 3;
+    const BURST_GAP_MS = 8_000;
+    const COOLDOWN_MS  = 30_000;
+    const schedule = (overrideDelay?: number) => {
+      if (cancelled) return;
+      let delay: number;
+      if (overrideDelay !== undefined) {
+        delay = overrideDelay;
+      } else {
+        burstCount += 1;
+        delay = burstCount < BURST_SIZE ? BURST_GAP_MS : COOLDOWN_MS;
+        if (burstCount >= BURST_SIZE) burstCount = 0;
+      }
+      ctxMetaPollRef.current = setTimeout(runPoll, delay);
+    };
+    const runPoll = () => {
+      if (cancelled) return;
+      fetchContextMeta(activeHlsUrl)
+        .then((m) => {
+          if (cancelled || !m) return;
           setActiveHlsTitleState(m.title);
           setActiveHlsArtistState(m.artist);
-        }
-      });
+        })
+        .catch(() => {})
+        .finally(() => schedule());
+    };
     // Delay the first context poll slightly so a freshly-mounted LivePlayerCard
     // (which has more detailed parsing) gets to run first.
-    const initial = setTimeout(poll, 3_000);
-    const interval = setInterval(poll, 20_000);
-    ctxMetaPollRef.current = interval;
-    return () => { clearTimeout(initial); clearInterval(interval); };
+    schedule(3_000);
+    // Re-poll instantly when the browser tab becomes visible again; reset burst.
+    const onVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        if (ctxMetaPollRef.current) { clearTimeout(ctxMetaPollRef.current); ctxMetaPollRef.current = null; }
+        burstCount = 0;
+        runPoll();
+      }
+    };
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      if (ctxMetaPollRef.current) { clearTimeout(ctxMetaPollRef.current); ctxMetaPollRef.current = null; }
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [activeHlsUrl]);
   // Ref to the play/pause toggle function registered by HLSListeningScreen
   const hlsToggleRef = useRef<(() => void) | null>(null);
@@ -560,6 +602,8 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
       hlsAudioRef,
       activeHlsUrl,
       setActiveHlsUrl,
+      activeHlsLabel,
+      setActiveHlsLabel,
       activeHlsTitle,
       activeHlsArtist,
       setActiveHlsMeta,
@@ -589,7 +633,7 @@ export function NowPlayingProvider({ children }: { children: ReactNode }) {
       setIsVisible,
     }),
     [currentTrack, hlsStream, hlsAudioRef, activeHlsUrl, setActiveHlsUrl,
-     activeHlsTitle, activeHlsArtist, setActiveHlsMeta, activeHlsPlaying, setActiveHlsPlaying, position,
+     activeHlsLabel, setActiveHlsLabel, activeHlsTitle, activeHlsArtist, setActiveHlsMeta, activeHlsPlaying, setActiveHlsPlaying, position,
      setIsVisible, setSession, seekToRatio, state, stepTrack,
      toggleFavorite, togglePlay, toggleQueue, toggleRepeat, toggleShuffle,
      setHlsStreamCallback, registerHlsToggle, toggleHlsPlay,

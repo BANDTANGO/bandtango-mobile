@@ -2,11 +2,13 @@ import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useState } from 'react';
 import { Text, View, Pressable, TextInput, Alert, ImageBackground } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { RootStackParamList } from '../types';
+import { AuthStackParamList } from '../types';
+import { useAuth, OAuthProvider } from '../state/AuthContext';
 
-type LoginScreenProps = NativeStackScreenProps<RootStackParamList, 'Login'>;
+type LoginScreenProps = NativeStackScreenProps<AuthStackParamList, 'Login'>;
 
 export function LoginScreen({ navigation }: LoginScreenProps) {
+  const { signIn } = useAuth();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
 
@@ -15,14 +17,15 @@ export function LoginScreen({ navigation }: LoginScreenProps) {
       Alert.alert('Error', 'Please enter both username and password');
       return;
     }
-    // TODO: Implement actual login logic
-    Alert.alert('Success', 'Login functionality to be implemented');
-    navigation.navigate('GettingStarted');
+    // TODO: POST credentials to /api/auth/login, receive session token,
+    // then call signIn('google') or a dedicated credential signIn method.
+    Alert.alert('Coming Soon', 'Email/password login is not yet connected.');
   };
 
-  const handleSocialLogin = (provider: string) => {
-    // TODO: Implement social login logic
-    Alert.alert('Social Login', `${provider} login to be implemented`);
+  const handleSocialLogin = (provider: OAuthProvider) => {
+    // Redirects browser to the backend OAuth entry point.
+    // On return the AuthContext will pick up the ?session= token automatically.
+    signIn(provider);
   };
 
   return (
@@ -37,12 +40,6 @@ export function LoginScreen({ navigation }: LoginScreenProps) {
       <View className="px-6">
         {/* Header */}
         <View className="mb-8">
-          <Pressable
-            onPress={() => navigation.goBack()}
-            className="mb-4 w-10 h-10 items-center justify-center rounded-full bg-[#1E293B]"
-          >
-            <Ionicons name="arrow-back" size={20} color="#F8FAFC" />
-          </Pressable>
           <Text className="text-2xl font-bold text-[#F8FAFC] mb-2">Sign In</Text>
         </View>
 
@@ -99,7 +96,7 @@ export function LoginScreen({ navigation }: LoginScreenProps) {
           <View className="flex-row justify-between">
             <Pressable
               className="flex-1 flex-row items-center justify-center bg-[#DC2626] py-3 rounded-lg mr-2"
-              onPress={() => handleSocialLogin('Google')}
+              onPress={() => handleSocialLogin('google')}
             >
               <Ionicons name="logo-google" size={20} color="#F8FAFC" />
               <Text className="ml-2 text-[#F8FAFC] font-medium text-sm">Google</Text>
@@ -107,7 +104,7 @@ export function LoginScreen({ navigation }: LoginScreenProps) {
 
             <Pressable
               className="flex-1 flex-row items-center justify-center bg-[#1877F2] py-3 rounded-lg mx-1"
-              onPress={() => handleSocialLogin('Facebook')}
+              onPress={() => handleSocialLogin('facebook')}
             >
               <Ionicons name="logo-facebook" size={20} color="#F8FAFC" />
               <Text className="ml-2 text-[#F8FAFC] font-medium text-sm">Facebook</Text>
@@ -115,7 +112,7 @@ export function LoginScreen({ navigation }: LoginScreenProps) {
 
             <Pressable
               className="flex-1 flex-row items-center justify-center bg-[#E4405F] py-3 rounded-lg ml-2"
-              onPress={() => handleSocialLogin('Instagram')}
+              onPress={() => handleSocialLogin('instagram')}
             >
               <Ionicons name="logo-instagram" size={20} color="#F8FAFC" />
               <Text className="ml-2 text-[#F8FAFC] font-medium text-sm">Instagram</Text>
@@ -123,11 +120,27 @@ export function LoginScreen({ navigation }: LoginScreenProps) {
           </View>
         </View>
 
-        {/* Sign Up Link */}
+        {/* Get Started Link */}
         <View className="items-center">
           <Text className="text-[#64748B] text-sm">
+            New here?{' '}
+            <Text
+              className="text-[#3B82F6]"
+              onPress={() => navigation.navigate('GettingStarted')}
+            >
+              Get Started
+            </Text>
+          </Text>
+        </View>
+        <View className="items-center mt-3">
+          <Text className="text-[#64748B] text-sm">
             Don't have an account?{' '}
-            <Text className="text-[#3B82F6]">Sign Up</Text>
+            <Text
+              className="text-[#3B82F6]"
+              onPress={() => navigation.navigate('CreateAccount')}
+            >
+              Create Account
+            </Text>
           </Text>
         </View>
       </View>

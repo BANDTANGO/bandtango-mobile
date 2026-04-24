@@ -27,15 +27,26 @@ export type MainStackParamList = {
   PlaylistDetail: { playlistId: string };
   CreatePlaylist: undefined;
   AddPlaylist: undefined;
+  Feedback: undefined;
   Settings: undefined;
 };
 
+/** Public routes — accessible without authentication. */
+export type AuthStackParamList = {
+  Login: undefined;
+  GettingStarted: undefined;
+  AboutYou: undefined;
+  AudioAgentPersonality: undefined;
+  CreateAccount: undefined;
+};
+
+/** @deprecated Use MainStackParamList + AuthStackParamList separately. */
 export type GettingStartedStackParamList = {
   GettingStarted: undefined;
   Login: undefined;
 };
 
-export type RootStackParamList = MainStackParamList & GettingStartedStackParamList;
+export type RootStackParamList = MainStackParamList & AuthStackParamList;
 
 // Extend React Navigation options to include custom properties
 declare global {

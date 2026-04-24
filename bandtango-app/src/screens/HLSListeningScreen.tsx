@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ImageBackground,
   Pressable,
@@ -14,6 +14,9 @@ import { LivePlayerCard } from '../components/LivePlayerCard';
 import { PRESET_STREAMS, StreamType, addCorsSafeOrigin } from '../data/streamPresets';
 import { MainStackParamList } from '../types';
 import { useNowPlaying } from '../state/NowPlayingContext';
+import { useAuth } from '../state/AuthContext';
+
+const API_BASE = 'http://localhost:7070';
 
 type UserPreset = { label: string; url: string; type: StreamType; corsOk: boolean };
 
@@ -26,7 +29,8 @@ function detectStreamType(url: string): StreamType {
 type Props = NativeStackScreenProps<MainStackParamList, 'HLSListening'>;
 
 export function HLSListeningScreen(_props: Props) {
-  const { setActiveHlsUrl, activeHlsUrl } = useNowPlaying();
+  const { setActiveHlsUrl, activeHlsUrl, activeHlsLabel, setActiveHlsLabel } = useNowPlaying();
+  const { user } = useAuth();
   const [urlInput, setUrlInput] = useState('');
   const [focused, setFocused] = useState(false);
   const [userPresets, setUserPresets] = useState<UserPreset[]>([]);
@@ -36,20 +40,54 @@ export function HLSListeningScreen(_props: Props) {
   const [presetType, setPresetType] = useState<StreamType>('icecast');
   const [presetCorsOk, setPresetCorsOk] = useState(false);
 
+  // ── Load user presets from API on mount ────────────────────────────────
+  useEffect(() => {
+    if (!user?.token) return;
+    fetch(`${API_BASE}/api/station/preset?email=${encodeURIComponent(user.email ?? '')}`, {
+      headers: { Authorization: `Bearer ${user.token}` },
+      cache: 'no-store',
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: UserPreset[] | null) => {
+        if (Array.isArray(data)) {
+          setUserPresets(data);
+          data.forEach((p) => { if (p.corsOk) addCorsSafeOrigin(p.url); });
+        }
+      })
+      .catch(() => { /* non-fatal — fall back to empty list */ });
+  }, [user?.token]);
+
   // Use context's activeHlsUrl as the source of truth for what's streaming.
   const activeUrl = activeHlsUrl;
 
   const allPresets = [...PRESET_STREAMS, ...userPresets];
   const isAlreadyPreset = !!activeUrl && allPresets.some((p) => p.url === activeUrl);
 
-  const handleStart = (url?: string) => {
+  const handleStart = (url?: string, label?: string) => {
     const target = (url ?? urlInput).trim();
     if (!target) return;
     setActiveHlsUrl(target);
+    // Use explicit label (from preset), otherwise derive a readable name from the URL.
+    if (label) {
+      setActiveHlsLabel(label);
+    } else {
+      try {
+        const parsed = new URL(target);
+        // e.g. "ice1.somafm.com / groovesalad-128-aac" → "groovesalad-128-aac @ ice1.somafm.com"
+        const pathPart = parsed.pathname.split('/').filter(Boolean)[0];
+        const derived = pathPart
+          ? `${pathPart} @ ${parsed.hostname}`
+          : parsed.hostname;
+        setActiveHlsLabel(derived);
+      } catch {
+        setActiveHlsLabel(target);
+      }
+    }
   };
 
   const handleStop = () => {
     setActiveHlsUrl('');
+    setActiveHlsLabel('');
     setSavingPreset(false);
   };
 
@@ -66,12 +104,32 @@ export function HLSListeningScreen(_props: Props) {
     const url   = activeUrl;
     if (!label || !url) { setSavingPreset(false); return; }
     if (presetCorsOk) addCorsSafeOrigin(url);
-    setUserPresets((prev) => [...prev, { label, url, type: presetType, corsOk: presetCorsOk }]);
+    const newPreset: UserPreset = { label, url, type: presetType, corsOk: presetCorsOk };
+    setUserPresets((prev) => [...prev.filter((p) => p.url !== url), newPreset]);
+    // Persist to API keyed by user email.
+    if (user?.token && user?.email) {
+      fetch(`${API_BASE}/api/station/preset`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${user.token}`,
+        },
+        body: JSON.stringify({ email: user.email, ...newPreset }),
+      }).catch(() => { /* best-effort */ });
+    }
+    // Update the live label in context so the player header reflects the saved name.
+    setActiveHlsLabel(label);
     setSavingPreset(false);
   };
 
   const removeUserPreset = (url: string) => {
     setUserPresets((prev) => prev.filter((p) => p.url !== url));
+    if (user?.token) {
+      fetch(`${API_BASE}/api/station/preset?url=${encodeURIComponent(url)}&email=${encodeURIComponent(user.email ?? '')}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${user.token}` },
+      }).catch(() => { /* best-effort */ });
+    }
   };
 
   return (
@@ -162,7 +220,7 @@ export function HLSListeningScreen(_props: Props) {
             </Text>
           </Pressable>
 
-          {activeUrl && !isAlreadyPreset && (
+          {!!activeUrl && !isAlreadyPreset && (
             <Pressable
               onPress={beginSavePreset}
               style={({ pressed }) => ({
@@ -286,7 +344,12 @@ export function HLSListeningScreen(_props: Props) {
           <View style={{ marginBottom: 24 }}>
             <LivePlayerCard
               url={activeUrl}
-              label={PRESET_STREAMS.find((s) => s.url === activeUrl)?.label ?? 'Custom Stream'}
+              label={
+                activeHlsLabel ||
+                PRESET_STREAMS.find((s) => s.url === activeUrl)?.label ||
+                userPresets.find((p) => p.url === activeUrl)?.label ||
+                'Custom Stream'
+              }
             />
           </View>
         ) : null}
@@ -304,7 +367,7 @@ export function HLSListeningScreen(_props: Props) {
               key={stream.url}
               onPress={() => {
                 setUrlInput(stream.url);
-                handleStart(stream.url);
+                handleStart(stream.url, stream.label);
               }}
               style={{ borderRadius: 8, overflow: 'hidden', borderWidth: 1, borderColor: isActive ? 'rgba(0,202,245,0.85)' : 'rgba(106, 120, 160, 0.85)', marginBottom: isLast ? 0 : 8 }}
             >

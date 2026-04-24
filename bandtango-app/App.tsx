@@ -13,7 +13,7 @@ import {
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { StatusBar } from 'expo-status-bar';
 import { useMemo, useEffect, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, Text, View } from 'react-native';
 import './global.css';
 import { NowPlayingMiniBar } from './src/components/NowPlayingMiniBar';
 import { seedPlaylists } from './src/data/seed';
@@ -23,21 +23,29 @@ import { AudioAgentScreen } from './src/screens/AudioAgentScreen';
 import { DiscoveryLevelScreen } from './src/screens/DiscoveryLevelScreen';
 import { ExploreScreen } from './src/screens/ExploreScreen';
 import { GettingStartedScreen } from './src/screens/GettingStartedScreen';
+import { AboutYouScreen }              from './src/screens/AboutYouScreen';
+import { AudioAgentPersonalityScreen } from './src/screens/AudioAgentPersonalityScreen';
+import { CreateAccountScreen }         from './src/screens/CreateAccountScreen';
+import AuthCallbackScreen              from './src/screens/AuthCallbackScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { PlaylistsScreen } from './src/screens/PlaylistsScreen';
 import { PlaylistDetailScreen } from './src/screens/PlaylistDetailScreen';
 import { HLSListeningScreen } from './src/screens/HLSListeningScreen';
+import { FeedbackScreen } from './src/screens/FeedbackScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { NowPlayingProvider } from './src/state/NowPlayingContext';
-import { Playlist, RootStackParamList, Song } from './src/types';
+import { AuthProvider, useAuth } from './src/state/AuthContext';
+import { AuthStackParamList, MainStackParamList, Playlist, RootStackParamList, Song } from './src/types';
 
-const Stack = createNativeStackNavigator<RootStackParamList>();
-const Drawer = createDrawerNavigator<{
-  MainStack: NavigatorScreenParams<RootStackParamList>;
-}>();
+const Stack       = createNativeStackNavigator<RootStackParamList>();
+const AuthStack   = createNativeStackNavigator<AuthStackParamList>();
+const Drawer      = createDrawerNavigator<{
+  MainStack: NavigatorScreenParams<MainStackParamList>;
+}>(); 
 
 function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
+  const { user, signOut } = useAuth();
   return (
     <DrawerContentScrollView
       contentContainerStyle={{ flex: 1, backgroundColor: '#0B1220', paddingTop: 8 }}
@@ -199,6 +207,29 @@ function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
             paddingVertical: 12,
           }}
           onPress={() => {
+            navigation.navigate('MainStack', { screen: 'Feedback' });
+            navigation.closeDrawer();
+          }}
+        >
+          <View style={{ alignItems: 'center', flexDirection: 'row' }}>
+            <Ionicons color="#F8FAFC" name="chatbubble-outline" size={18} />
+            <View style={{ width: 8 }} />
+            <Text style={{ color: '#F8FAFC', fontSize: 15, fontWeight: '600' }}>
+              Feedback
+            </Text>
+          </View>
+        </Pressable>
+
+        <Pressable
+          style={{
+            marginBottom: 10,
+            borderColor: '#334155',
+            borderRadius: 12,
+            borderWidth: 1,
+            paddingHorizontal: 12,
+            paddingVertical: 12,
+          }}
+          onPress={() => {
             navigation.navigate('MainStack', { screen: 'Settings' });
             navigation.closeDrawer();
           }}
@@ -211,12 +242,37 @@ function AppDrawerContent({ navigation }: DrawerContentComponentProps) {
             </Text>
           </View>
         </Pressable>
+
+        <Pressable
+          style={{
+            marginBottom: 10,
+            borderColor: '#4B1D1D',
+            borderRadius: 12,
+            borderWidth: 1,
+            paddingHorizontal: 12,
+            paddingVertical: 12,
+          }}
+          onPress={() => { navigation.closeDrawer(); signOut(); }}
+        >
+          <View style={{ alignItems: 'center', flexDirection: 'row' }}>
+            <Ionicons color="#F87171" name="log-out-outline" size={18} />
+            <View style={{ width: 8 }} />
+            <Text style={{ color: '#F87171', fontSize: 15, fontWeight: '600' }}>
+              Sign Out
+            </Text>
+            {user?.name ? (
+              <Text style={{ color: '#64748B', fontSize: 12, marginLeft: 8 }} numberOfLines={1}>
+                ({user.name})
+              </Text>
+            ) : null}
+          </View>
+        </Pressable>
       </View>
     </DrawerContentScrollView>
   );
 }
 
-export default function App() {
+function ProtectedApp() {
   const [playlists, setPlaylists] = useState<Playlist[]>(seedPlaylists);
   const [apiPlaylists, setApiPlaylists] = useState<Playlist[]>([]);
   const [apiLoading, setApiLoading] = useState(true);
@@ -387,21 +443,21 @@ export default function App() {
       />
 
       <Stack.Screen
+        name="Feedback"
+        component={FeedbackScreen}
+        options={{ title: 'Feedback' }}
+      />
+      <Stack.Screen
         name="Settings"
         component={SettingsScreen}
         options={{ title: 'Settings' }}
       />
 
+      {/* GettingStarted is accessible from within the protected app (e.g. onboarding replay) */}
       <Stack.Screen
         name="GettingStarted"
         component={GettingStartedScreen}
         options={{ title: 'Getting Started', headerShown: false }}
-      />
-
-      <Stack.Screen
-        name="Login"
-        component={LoginScreen}
-        options={{ title: 'Login', headerShown: false }}
       />
 
       <Stack.Screen name="AddPlaylist" options={{ title: 'New Playlist' }}>
@@ -463,26 +519,68 @@ export default function App() {
   );
 
   return (
+    <View style={{ flex: 1, backgroundColor: '#0B1220' }}>
+      <Drawer.Navigator
+        drawerContent={(props) => <AppDrawerContent {...props} />}
+        screenOptions={{
+          drawerStyle: { backgroundColor: '#0B1220', width: 280 },
+          headerShown: false,
+        }}
+      >
+        <Drawer.Screen component={MainStackNavigator} name="MainStack" />
+      </Drawer.Navigator>
+      <NowPlayingMiniBar />
+    </View>
+  );
+}
+
+// ── Public navigator (no auth required) ─────────────────────────────────────
+function PublicNavigator() {
+  return (
+    <AuthStack.Navigator screenOptions={{ headerShown: false }}>
+      <AuthStack.Screen name="GettingStarted" component={GettingStartedScreen} />
+      <AuthStack.Screen name="Login"          component={LoginScreen} />
+      <AuthStack.Screen name="AboutYou"              component={AboutYouScreen} />
+      <AuthStack.Screen name="AudioAgentPersonality" component={AudioAgentPersonalityScreen} />
+      <AuthStack.Screen name="CreateAccount"         component={CreateAccountScreen} />
+    </AuthStack.Navigator>
+  );
+}
+
+// ── Root switcher — renders public or protected tree based on auth state ─────
+function AppContent() {
+  const { user, loading, authError, clearAuthError } = useAuth();
+
+  if (loading) {
+    return (
+      <View style={{ flex: 1, backgroundColor: '#0B1220', alignItems: 'center', justifyContent: 'center' }}>
+        <ActivityIndicator size="large" color="#3B82F6" />
+      </View>
+    );
+  }
+
+  // OAuth callback exchange failed — show support screen.
+  if (authError) return <AuthCallbackScreen onBack={clearAuthError} />;
+
+  // Unauthenticated — show only the public routes
+  if (!user) return <PublicNavigator />;
+
+  // Authenticated — show the full protected app
+  return <ProtectedApp />;
+}
+
+// ── App entry point — providers only, no navigation logic ────────────────────
+export default function App() {
+  return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-    <NowPlayingProvider>
-      <View style={{ flex: 1, backgroundColor: '#0B1220' }}>
-        <View style={{ flex: 1, backgroundColor: '#0B1220' }}>
+      <AuthProvider>
+        <NowPlayingProvider>
           <NavigationContainer>
             <StatusBar style="light" />
-            <Drawer.Navigator
-              drawerContent={(props) => <AppDrawerContent {...props} />}
-              screenOptions={{
-                drawerStyle: { backgroundColor: '#0B1220', width: 280 },
-                headerShown: false,
-              }}
-            >
-              <Drawer.Screen component={MainStackNavigator} name="MainStack" />
-            </Drawer.Navigator>
+            <AppContent />
           </NavigationContainer>
-          <NowPlayingMiniBar />
-        </View>
-      </View>
-    </NowPlayingProvider>
+        </NowPlayingProvider>
+      </AuthProvider>
     </GestureHandlerRootView>
   );
 }
