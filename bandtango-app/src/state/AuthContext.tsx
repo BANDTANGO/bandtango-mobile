@@ -14,7 +14,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useState, ReactNode } from 'react';
 
-const AUTH_BASE = 'https://bandtango-vision-dev-732971614822.us-south1.run.app:7070';
+const AUTH_BASE = 'http://localhost:7070';
 
 export type OAuthProvider = 'google' | 'facebook' | 'instagram';
 
